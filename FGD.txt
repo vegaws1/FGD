@@ -1,125 +1,116 @@
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.datasets import mnist
-from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from scipy.special import gamma
 import matplotlib.pyplot as plt
 
-# Load and preprocess MNIST
-(x_train, y_train), (x_test, y_test) = mnist.load_data()
-x_train = x_train.reshape(-1, 28*28).astype("float32") / 255.0
-x_test = x_test.reshape(-1, 28*28).astype("float32") / 255.0
-y_train = to_categorical(y_train, 10)
-y_test = to_categorical(y_test, 10)
+# Load and preprocess Breast Cancer dataset
+data = load_breast_cancer()
+X, y = data.data, data.target
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Model definition
-def create_model():
-    model = Sequential([
-        Dense(128, activation='relu', input_shape=(784,), 
-              kernel_initializer='he_normal', bias_initializer='zeros'),
-        Dense(10, activation='softmax', 
-              kernel_initializer='glorot_uniform', bias_initializer='zeros')
-    ])
-    return model
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
 
-# Classical GD (Baseline)
-model_gd = create_model()
-model_gd.compile(optimizer=tf.keras.optimizers.SGD(learning_rate=0.1),
-                 loss='categorical_crossentropy', 
-                 metrics=['accuracy'])
-history_gd = model_gd.fit(x_train, y_train, 
-                          epochs=20,
-                          batch_size=256, 
-                          validation_data=(x_test, y_test), 
-                          verbose=1)
+# Reshape y for binary classification compatibility with softmax (2 classes)
+y_train = y_train.reshape(-1, 1)
+y_test = y_test.reshape(-1, 1)
+y_train_onehot = np.hstack([1 - y_train, y_train])  # One-hot encoding: [0, 1] or [1, 0]
+y_test_onehot = np.hstack([1 - y_test, y_test])
 
-# FGD Implementation (Aligned with Theory)
-alpha = 0.7  
-eta = 0.05   
-epochs = 20
-batch_size = 256
-history_length = 20  # Truncated gradient memory
+# Define the model: deeper network to increase optimization complexity
+model = tf.keras.Sequential([
+    tf.keras.layers.Dense(32, activation='relu', input_shape=(30,)),  # 30 features
+    tf.keras.layers.Dense(32, activation='relu'),
+    tf.keras.layers.Dense(32, activation='relu'),
+    tf.keras.layers.Dense(2, activation='softmax')  # 2 classes
+])
 
+# Hyperparameters
+learning_rate = 0.5
+alpha = 0.1  # Fractional order for FGD
+history_length = 10  # Number of past gradients to consider
+num_epochs = 300
+
+# Loss function
+loss_fn = tf.keras.losses.CategoricalCrossentropy()
+
+# Function to compute Grünwald-Letnikov weights for FGD
 def compute_gl_weights(k, alpha):
     weights = []
     for j in range(k + 1):
+        # Add small epsilon to avoid division issues in gamma
         binom = (-1)**j * gamma(alpha + 1) / (gamma(j + 1) * gamma(alpha - j + 1 + 1e-10))
         weights.append(binom)
-    return np.array(weights) / gamma(1 - alpha)  # Normalization
+    return np.array(weights)
 
-model_fgd = create_model()
-grad_history = []
-train_loss_fgd = []
-val_accuracy_fgd = []
-
-for epoch in range(epochs):
-    print(f"Epoch {epoch + 1}/{epochs}")
-    for i in range(0, len(x_train), batch_size):
-        x_batch = x_train[i:i+batch_size]
-        y_batch = y_train[i:i+batch_size]
-        
+# Training function for GD
+def train_gd(model, X_train, y_train_onehot, learning_rate, num_epochs):
+    losses = []
+    for epoch in range(num_epochs):
         with tf.GradientTape() as tape:
-            preds = model_fgd(x_batch)
-            loss = tf.reduce_mean(tf.keras.losses.categorical_crossentropy(y_batch, preds))
-        grads = tape.gradient(loss, model_fgd.trainable_variables)
-        grad_history.append(grads)
-        
-        # Truncate history to match Theorem 3.6
-        if len(grad_history) > history_length:
-            grad_history.pop(0)
-        
-        k = len(grad_history) - 1
+            preds = model(X_train, training=True)
+            loss = loss_fn(y_train_onehot, preds)
+        grads = tape.gradient(loss, model.trainable_variables)
+        for var, grad in zip(model.trainable_variables, grads):
+            var.assign_sub(learning_rate * grad)
+        losses.append(loss.numpy())
+    return losses
+
+# Training function for FGD
+def train_fgd(model, X_train, y_train_onehot, learning_rate, alpha, history_length, num_epochs):
+    grad_history = [[] for _ in model.trainable_variables]
+    losses = []
+    for epoch in range(num_epochs):
+        with tf.GradientTape() as tape:
+            preds = model(X_train, training=True)
+            loss = loss_fn(y_train_onehot, preds)
+        grads = tape.gradient(loss, model.trainable_variables)
+        # Update gradient history
+        for i, grad in enumerate(grads):
+            grad_history[i].append(grad)
+            if len(grad_history[i]) > history_length:
+                grad_history[i].pop(0)
+        # Compute fractional gradients
+        k = len(grad_history[0]) - 1  # Number of past gradients available
         weights = compute_gl_weights(k, alpha)
-        fractional_grad = [tf.zeros_like(g) for g in grads]
-        
-        # Aggregate historical gradients
-        for j in range(k + 1):
-            for var_idx in range(len(grads)):
-                fractional_grad[var_idx] += weights[j] * grad_history[-(j+1)][var_idx]
-        
+        fractional_grads = []
+        for i in range(len(grads)):
+            f_grad = sum(weights[j] * grad_history[i][-(j + 1)] for j in range(k + 1))
+            fractional_grads.append(f_grad)
         # Update parameters
-        for var, f_grad in zip(model_fgd.trainable_variables, fractional_grad):
-            var.assign_sub(eta * f_grad)
-    
-    # Track metrics
-    train_loss = tf.reduce_mean(tf.keras.losses.categorical_crossentropy(y_train, model_fgd(x_train))).numpy()
-    train_loss_fgd.append(train_loss)
-    val_pred = model_fgd.predict(x_test, verbose=0)
-    val_accuracy = np.mean(np.argmax(val_pred, axis=1) == np.argmax(y_test, axis=1))
-    val_accuracy_fgd.append(val_accuracy)
+        for var, f_grad in zip(model.trainable_variables, fractional_grads):
+            var.assign_sub(learning_rate * f_grad)
+        losses.append(loss.numpy())
+    return losses
 
-# Plotting with corrected labels/annotations
-plt.figure(figsize=(12, 5))
-plt.suptitle("MNIST Classification: GD vs FGD (α=0.7)", y=1.02)
+# Train with GD
+model_gd = tf.keras.models.clone_model(model)
+model_gd.compile(optimizer='sgd', loss=loss_fn)  # Compile to initialize weights
+gd_losses = train_gd(model_gd, X_train, y_train_onehot, learning_rate, num_epochs)
 
-# Training Loss Plot
-plt.subplot(1, 2, 1)
-plt.plot(history_gd.history['loss'], 'b--', label='GD Loss')
-plt.plot(train_loss_fgd, 'r-', label=f'FGD (α={alpha})')
+# Train with FGD
+model_fgd = tf.keras.models.clone_model(model)
+model_fgd.compile(optimizer='sgd', loss=loss_fn)  # Compile to initialize weights
+fgd_losses = train_fgd(model_fgd, X_train, y_train_onehot, learning_rate, alpha, history_length, num_epochs)
+
+# Plot training losses
+plt.figure(figsize=(10, 5))
+plt.plot(gd_losses, label='GD')
+plt.plot(fgd_losses, label=f'FGD (α={alpha})')
 plt.xlabel('Epoch')
 plt.ylabel('Training Loss')
 plt.legend()
-plt.grid(True)
+plt.title('Training Loss: GD vs FGD on Breast Cancer Dataset')
+plt.show()
 
-# Test Accuracy Plot
-plt.subplot(1, 2, 2)
-plt.plot(history_gd.history['val_accuracy'], 'g--', label='GD Accuracy')
-plt.plot(val_accuracy_fgd, 'orange', label=f'FGD (α={alpha})')
-plt.xlabel('Epoch')
-plt.ylabel('Test Accuracy')
-plt.legend()
-plt.grid(True)
-
-# Add key annotations
-plt.annotate('FGD: 95% Accuracy\nGD: 92% Accuracy', 
-             xy=(17.5, 0.95), xytext=(12, 0.85),
-             arrowprops=dict(facecolor='black', shrink=0.05))
-
-plt.annotate('FGD Loss = 0.05\nGD Loss = 0.10', 
-             xy=(17.5, 0.05), xytext=(12, 0.25),
-             arrowprops=dict(facecolor='black', shrink=0.05))
-
-plt.tight_layout()
-plt.show() 
+# Optional: Evaluate final accuracy
+gd_preds = model_gd.predict(X_test)
+fgd_preds = model_fgd.predict(X_test)
+gd_accuracy = np.mean(np.argmax(gd_preds, axis=1) == np.argmax(y_test_onehot, axis=1))
+fgd_accuracy = np.mean(np.argmax(fgd_preds, axis=1) == np.argmax(y_test_onehot, axis=1))
+print(f"GD Test Accuracy: {gd_accuracy:.4f}")
+print(f"FGD Test Accuracy: {fgd_accuracy:.4f}")
