@@ -1,0 +1,109 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+from scipy.special import binom
+
+# ========== HYPERPARAMETERS ========== 
+ALPHA = 0.6    # Fractional order (initialize upfront)
+LAMBDA = 0.5   # Tempering parameter (initialize upfront)
+LEARNING_RATE = 0.1
+EPOCHS = 100
+
+# Load and Preprocess Data
+data = load_breast_cancer()
+X, y = data.data, data.target
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Sigmoid and Loss
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+def cross_entropy_loss(y_true, y_pred):
+    return -np.mean(y_true * np.log(y_pred + 1e-8) + (1 - y_true) * np.log(1 - y_pred + 1e-8))
+
+# TFGD Optimizer (Properly uses α and λ)
+class TFGDOptimizer:
+    def __init__(self):
+        self.S = None  # Memory term
+    
+    def update(self, params, grads):
+        if self.S is None:
+            self.S = np.zeros_like(params)
+        # Update rule: S_k = binom(α,0)*grads + e^{-λ} * S_{k-1}
+        self.S = binom(ALPHA, 0) * grads + np.exp(-LAMBDA) * self.S  # binom(α,0) = 1
+        params -= LEARNING_RATE * self.S
+        return params
+
+# Logistic Regression Model
+class LogisticRegression:
+    def __init__(self, input_dim):
+        self.weights = np.random.randn(input_dim)
+        self.bias = np.random.randn(1)
+    
+    def forward(self, X):
+        return sigmoid(X @ self.weights + self.bias)
+    
+    def compute_gradients(self, X, y_true, y_pred):
+        error = y_pred - y_true
+        dw = (X.T @ error) / len(y_true)
+        db = np.mean(error)
+        return dw, db
+
+# Training with TFGD
+def train_tfgd(X_train, y_train):
+    model = LogisticRegression(X_train.shape[1])
+    optimizer_weights = TFGDOptimizer()
+    optimizer_bias = TFGDOptimizer()
+    losses = []
+    
+    for epoch in range(EPOCHS):
+        y_pred = model.forward(X_train)
+        loss = cross_entropy_loss(y_train, y_pred)
+        losses.append(loss)
+        
+        dw, db = model.compute_gradients(X_train, y_train, y_pred)
+        model.weights = optimizer_weights.update(model.weights, dw)
+        model.bias = optimizer_bias.update(model.bias, db)
+        
+    return model, losses
+
+# Training with SGD (Baseline)
+def train_sgd(X_train, y_train):
+    model = LogisticRegression(X_train.shape[1])
+    losses = []
+    
+    for epoch in range(EPOCHS):
+        y_pred = model.forward(X_train)
+        loss = cross_entropy_loss(y_train, y_pred)
+        losses.append(loss)
+        
+        dw, db = model.compute_gradients(X_train, y_train, y_pred)
+        model.weights -= LEARNING_RATE * dw
+        model.bias -= LEARNING_RATE * db
+        
+    return model, losses
+
+# Train Models
+model_tfgd, loss_tfgd = train_tfgd(X_train, y_train)
+model_sgd, loss_sgd = train_sgd(X_train, y_train)
+
+# Evaluate
+y_pred_tfgd = (model_tfgd.forward(X_test) > 0.5).astype(int)
+y_pred_sgd = (model_sgd.forward(X_test) > 0.5).astype(int)
+
+print(f"TFGD (α={ALPHA}, λ={LAMBDA}) Test Accuracy: {accuracy_score(y_test, y_pred_tfgd):.4f}")
+print(f"SGD Test Accuracy: {accuracy_score(y_test, y_pred_sgd):.4f}")
+
+# Plot
+plt.figure(figsize=(10, 5))
+plt.plot(loss_tfgd, label=f'TFGD (α={ALPHA}, λ={LAMBDA})', linestyle='--')
+plt.plot(loss_sgd, label='SGD', linestyle='-')
+plt.xlabel('Epochs')
+plt.ylabel('Cross-Entropy Loss')
+plt.legend()
+plt.show()
