@@ -248,3 +248,195 @@ fig.suptitle('Sensitivity analysis', fontsize=16)
 fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.savefig('images/sensitivity.png', dpi=300)
 plt.show()
+
+#------------Additional Benchmark Experiments-------------
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.datasets import load_breast_cancer, make_classification, load_digits
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+from scipy.special import binom
+
+# ========== HYPERPARAMETERS ==========
+# Breast‑cancer sweep
+ALPHA_LIST = np.linspace(0.1, 1.0, 10)
+LAMBDA_LIST = np.linspace(0.0, 1.0, 10)
+LEARNING_RATE = 0.1
+MAX_EPOCHS = 200
+CONV_THRESHOLD = 1e-4
+CONV_PATIENCE = 5
+
+# Extra benchmarks
+EPOCHS_EXTRA = 100  # you can reduce for speed
+BEST_ALPHA = 0.7
+BEST_LAMBDA = 0.3
+
+# ========== HELPERS ==========
+
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+def cross_entropy_loss(y_true, y_pred):
+    return -np.mean(y_true * np.log(y_pred + 1e-8) +
+                    (1 - y_true) * np.log(1 - y_pred + 1e-8))
+
+class TFGDOptimizer:
+    def __init__(self, alpha, lambd):
+        self.alpha = alpha
+        self.lambd = lambd
+        self.S = None
+
+    def update(self, params, grads):
+        if self.S is None:
+            self.S = np.zeros_like(params)
+        # binom(alpha,0) = 1
+        self.S = grads + np.exp(-self.lambd) * self.S
+        return params - LEARNING_RATE * self.S
+
+class LogisticRegression:
+    def __init__(self, dim):
+        self.w = np.random.randn(dim)
+        self.b = np.random.randn()
+
+    def forward(self, X):
+        return sigmoid(X @ self.w + self.b)
+
+    def compute_gradients(self, X, y_true, y_pred):
+        err = y_pred - y_true
+        dw = (X.T @ err) / len(y_true)
+        db = np.mean(err)
+        return dw, db
+
+# ========== SENSITIVITY SWEEP ==========
+
+def train_and_get_metrics(alpha, lambd):
+    # load & preprocess
+    data = load_breast_cancer()
+    X, y = data.data, data.target
+    X = StandardScaler().fit_transform(X)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42)
+
+    model = LogisticRegression(X_train.shape[1])
+    opt_w = TFGDOptimizer(alpha, lambd)
+    opt_b = TFGDOptimizer(alpha, lambd)
+    losses = []
+
+    for epoch in range(1, MAX_EPOCHS + 1):
+        y_pred = model.forward(X_train)
+        loss = cross_entropy_loss(y_train, y_pred)
+        losses.append(loss)
+
+        dw, db = model.compute_gradients(X_train, y_train, y_pred)
+        model.w = opt_w.update(model.w, dw)
+        model.b = opt_b.update(model.b, db)
+
+        if epoch > CONV_PATIENCE:
+            recent = np.diff(losses[-CONV_PATIENCE:])
+            if np.all(np.abs(recent) < CONV_THRESHOLD):
+                conv_epoch = epoch
+                break
+    else:
+        conv_epoch = MAX_EPOCHS
+
+    y_test_pred = (model.forward(X_test) > 0.5).astype(int)
+    acc = accuracy_score(y_test, y_test_pred)
+    return acc, conv_epoch
+
+# Run sweeps
+acc_vs_alpha, conv_vs_alpha = [], []
+for α in ALPHA_LIST:
+    a, c = train_and_get_metrics(α, 0.5)
+    acc_vs_alpha.append(a)
+    conv_vs_alpha.append(c)
+
+acc_vs_lambda, conv_vs_lambda = [], []
+for λ in LAMBDA_LIST:
+    a, c = train_and_get_metrics(0.6, λ)
+    acc_vs_lambda.append(a)
+    conv_vs_lambda.append(c)
+
+# Plot sensitivity
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+plt.subplots_adjust(wspace=0.3, hspace=0.4)
+
+axes[0,0].plot(ALPHA_LIST, acc_vs_alpha, marker='o')
+axes[0,0].set_title('(a) Accuracy vs. α (λ=0.5)')
+axes[0,0].set_xlabel('α'); axes[0,0].set_ylabel('Test Accuracy')
+
+axes[0,1].plot(LAMBDA_LIST, acc_vs_lambda, marker='o')
+axes[0,1].set_title('(b) Accuracy vs. λ (α=0.6)')
+axes[0,1].set_xlabel('λ'); axes[0,1].set_ylabel('Test Accuracy')
+
+axes[1,0].plot(ALPHA_LIST, conv_vs_alpha, marker='o')
+axes[1,0].set_title('(c) Convergence Epoch vs. α')
+axes[1,0].set_xlabel('α'); axes[1,0].set_ylabel('Epoch of Convergence')
+
+axes[1,1].plot(LAMBDA_LIST, conv_vs_lambda, marker='o')
+axes[1,1].set_title('(d) Convergence Epoch vs. λ')
+axes[1,1].set_xlabel('λ'); axes[1,1].set_ylabel('Epoch of Convergence')
+
+fig.suptitle('Sensitivity analysis', fontsize=16)
+fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.savefig('images/sensitivity.png', dpi=300)
+plt.show()
+
+# ========== EXTRA BENCHMARKS ==========
+
+def evaluate_on_dataset(X, y, alpha, lambd, epochs):
+    # preprocess
+    X = StandardScaler().fit_transform(X)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42)
+
+    # TFGD
+    model = LogisticRegression(X_train.shape[1])
+    opt_w = TFGDOptimizer(alpha, lambd)
+    opt_b = TFGDOptimizer(alpha, lambd)
+    for _ in range(epochs):
+        y_pred = model.forward(X_train)
+        dw, db = model.compute_gradients(X_train, y_train, y_pred)
+        model.w = opt_w.update(model.w, dw)
+        model.b = opt_b.update(model.b, db)
+    acc_tfgd = accuracy_score(
+        y_test, (model.forward(X_test) > 0.5).astype(int))
+
+    # SGD
+    model_s = LogisticRegression(X_train.shape[1])
+    for _ in range(epochs):
+        y_pred_s = model_s.forward(X_train)
+        dw, db = model_s.compute_gradients(X_train, y_train, y_pred_s)
+        model_s.w -= LEARNING_RATE * dw
+        model_s.b -= LEARNING_RATE * db
+    acc_sgd = accuracy_score(
+        y_test, (model_s.forward(X_test) > 0.5).astype(int))
+
+    return acc_tfgd, acc_sgd
+
+# 1) High‑dim synthetic
+X_hd, y_hd = make_classification(
+    n_samples=2000, n_features=1000,
+    n_informative=50, n_redundant=0, n_repeated=0,
+    n_classes=2, flip_y=0.01, class_sep=1.0,
+    random_state=42)
+
+# 2) Noisy digits (0 vs rest)
+digits = load_digits()
+X_d, y_d = digits.data, digits.target
+y_d = (y_d == 0).astype(int)
+noise = np.random.normal(scale=4.0, size=X_d.shape)
+X_dn = X_d + noise
+
+for name, X_, y_ in [
+    ("High‑dim synthetic", X_hd, y_hd),
+    ("Noisy digits (0 vs rest)", X_dn, y_d)
+]:
+    acc_t, acc_s = evaluate_on_dataset(
+        X_, y_, BEST_ALPHA, BEST_LAMBDA, EPOCHS_EXTRA)
+    print(f"{name:25s} | TFGD: {acc_t:.4f} | SGD: {acc_s:.4f}")
+
+
+
+
