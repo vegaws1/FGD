@@ -107,3 +107,144 @@ plt.xlabel('Epochs')
 plt.ylabel('Cross-Entropy Loss')
 plt.legend()
 plt.show()
+
+
+#-------Sensitivity Analysis on Hyperparameters---------
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+from scipy.special import binom
+
+# ========== SETTINGS ==========
+ALPHA_LIST = np.linspace(0.1, 1.0, 10)   # values of fractional order to try
+LAMBDA_LIST = np.linspace(0.0, 1.0, 10)  # values of tempering to try
+LEARNING_RATE = 0.1
+MAX_EPOCHS = 200
+CONV_THRESHOLD = 1e-4   # threshold for loss change to count as "converged"
+CONV_PATIENCE = 5       # number of epochs with small change to trigger convergence
+
+# Load and preprocess data
+data = load_breast_cancer()
+X, y = data.data, data.target
+X = StandardScaler().fit_transform(X)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42)
+
+# Activation and loss
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+def cross_entropy_loss(y_true, y_pred):
+    return -np.mean(y_true * np.log(y_pred + 1e-8) +
+                    (1 - y_true) * np.log(1 - y_pred + 1e-8))
+
+# TFGD optimizer that uses α and λ
+class TFGDOptimizer:
+    def __init__(self, alpha, lambd):
+        self.alpha = alpha
+        self.lambd = lambd
+        self.S = None
+
+    def update(self, params, grads):
+        if self.S is None:
+            self.S = np.zeros_like(params)
+        # S_k = binom(α,0)*grads + exp(-λ)*S_{k-1}, and binom(α,0)=1
+        self.S = grads + np.exp(-self.lambd) * self.S
+        return params - LEARNING_RATE * self.S
+
+# Simple logistic regression model
+class LogisticRegression:
+    def __init__(self, dim):
+        self.w = np.random.randn(dim)
+        self.b = np.random.randn()
+
+    def forward(self, X):
+        return sigmoid(X @ self.w + self.b)
+
+    def grads(self, X, y_true, y_pred):
+        err = y_pred - y_true
+        dw = (X.T @ err) / len(y_true)
+        db = np.mean(err)
+        return dw, db
+
+# Train with TFGD, returning final accuracy and epoch of convergence
+def train_and_evaluate(alpha, lambd):
+    model = LogisticRegression(X_train.shape[1])
+    opt_w = TFGDOptimizer(alpha, lambd)
+    opt_b = TFGDOptimizer(alpha, lambd)
+    losses = []
+
+    for epoch in range(1, MAX_EPOCHS + 1):
+        y_pred = model.forward(X_train)
+        loss = cross_entropy_loss(y_train, y_pred)
+        losses.append(loss)
+
+        dw, db = model.grads(X_train, y_train, y_pred)
+        model.w = opt_w.update(model.w, dw)
+        model.b = opt_b.update(model.b, db)
+
+        # check convergence: small change over last CONV_PATIENCE epochs
+        if epoch > CONV_PATIENCE:
+            recent = np.diff(losses[-CONV_PATIENCE:])
+            if np.all(np.abs(recent) < CONV_THRESHOLD):
+                conv_epoch = epoch
+                break
+    else:
+        conv_epoch = MAX_EPOCHS
+
+    # test accuracy
+    y_test_pred = (model.forward(X_test) > 0.5).astype(int)
+    acc = accuracy_score(y_test, y_test_pred)
+    return acc, conv_epoch
+
+# Preallocate results
+acc_vs_alpha = []
+conv_vs_alpha = []
+for α in ALPHA_LIST:
+    acc, epoch = train_and_evaluate(alpha=α, lambd=0.5)
+    acc_vs_alpha.append(acc)
+    conv_vs_alpha.append(epoch)
+
+acc_vs_lambda = []
+conv_vs_lambda = []
+for λ in LAMBDA_LIST:
+    acc, epoch = train_and_evaluate(alpha=0.6, lambd=λ)
+    acc_vs_lambda.append(acc)
+    conv_vs_lambda.append(epoch)
+
+# === Plot the 4-panel sensitivity figure ===
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+plt.subplots_adjust(wspace=0.3, hspace=0.4)
+
+# (a) Accuracy vs α (λ fixed)
+axes[0,0].plot(ALPHA_LIST, acc_vs_alpha, marker='o')
+axes[0,0].set_title('(a) Accuracy vs. α\n(λ = 0.5)')
+axes[0,0].set_xlabel('α')
+axes[0,0].set_ylabel('Test Accuracy')
+
+# (b) Accuracy vs λ (α fixed)
+axes[0,1].plot(LAMBDA_LIST, acc_vs_lambda, marker='o')
+axes[0,1].set_title('(b) Accuracy vs. λ\n(α = 0.6)')
+axes[0,1].set_xlabel('λ')
+axes[0,1].set_ylabel('Test Accuracy')
+
+# (c) Convergence epoch vs α
+axes[1,0].plot(ALPHA_LIST, conv_vs_alpha, marker='o')
+axes[1,0].set_title('(c) Convergence Epoch vs. α')
+axes[1,0].set_xlabel('α')
+axes[1,0].set_ylabel('Epoch of Convergence')
+
+# (d) Convergence epoch vs λ
+axes[1,1].plot(LAMBDA_LIST, conv_vs_lambda, marker='o')
+axes[1,1].set_title('(d) Convergence Epoch vs. λ')
+axes[1,1].set_xlabel('λ')
+axes[1,1].set_ylabel('Epoch of Convergence')
+
+fig.suptitle('Sensitivity analysis', fontsize=16)
+fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.savefig('images/sensitivity.png', dpi=300)
+plt.show()
