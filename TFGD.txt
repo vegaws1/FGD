@@ -437,6 +437,146 @@ for name, X_, y_ in [
         X_, y_, BEST_ALPHA, BEST_LAMBDA, EPOCHS_EXTRA)
     print(f"{name:25s} | TFGD: {acc_t:.4f} | SGD: {acc_s:.4f}")
 
+#----------------------------------Comparison with Adaptive Optimizers
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+from scipy.special import binom
+
+# Ensure the output directory exists
+os.makedirs('figures', exist_ok=True)
+
+# Hyperparameters
+ALPHA = 0.6    # Fractional order for TFGD
+LAMBDA = 0.5   # Tempering parameter for TFGD
+LEARNING_RATE = 0.1
+EPOCHS = 100
+
+# Load and preprocess data
+data = load_breast_cancer()
+X, y = data.data, data.target
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Sigmoid and loss functions
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+def cross_entropy_loss(y_true, y_pred):
+    return -np.mean(y_true * np.log(y_pred + 1e-8) + (1 - y_true) * np.log(1 - y_pred + 1e-8))
+
+# Logistic Regression model
+class LogisticRegression:
+    def __init__(self, dim):
+        self.w = np.random.randn(dim)
+        self.b = np.random.randn()
+        
+    def forward(self, X):
+        return sigmoid(X @ self.w + self.b)
+    
+    def grads(self, X, y_true, y_pred):
+        err = y_pred - y_true
+        dw = (X.T @ err) / len(y_true)
+        db = np.mean(err)
+        return dw, db
+
+# TFGD Optimizer
+class TFGDOptimizer:
+    def __init__(self, alpha, lambd):
+        self.alpha = alpha
+        self.lambd = lambd
+        self.S = None
+
+    def update(self, params, grads):
+        if self.S is None:
+            self.S = np.zeros_like(params)
+        self.S = binom(self.alpha, 0) * grads + np.exp(-self.lambd) * self.S
+        return params - LEARNING_RATE * self.S
+
+# Adam Optimizer
+class AdamOptimizer:
+    def __init__(self, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m = None
+        self.v = None
+        self.t = 0
+
+    def update(self, params, grads):
+        if self.m is None:
+            self.m = np.zeros_like(grads)
+            self.v = np.zeros_like(grads)
+        self.t += 1
+        self.m = self.beta1 * self.m + (1 - self.beta1) * grads
+        self.v = self.beta2 * self.v + (1 - self.beta2) * (grads ** 2)
+        m_hat = self.m / (1 - self.beta1 ** self.t)
+        v_hat = self.v / (1 - self.beta2 ** self.t)
+        return params - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+# RMSprop Optimizer
+class RMSpropOptimizer:
+    def __init__(self, lr=0.001, decay=0.9, eps=1e-8):
+        self.lr = lr
+        self.decay = decay
+        self.eps = eps
+        self.cache = None
+
+    def update(self, params, grads):
+        if self.cache is None:
+            self.cache = np.zeros_like(grads)
+        self.cache = self.decay * self.cache + (1 - self.decay) * (grads ** 2)
+        return params - self.lr * grads / (np.sqrt(self.cache) + self.eps)
+
+# Training function
+def train_model(optimizer_class, optimizer_kwargs):
+    model = LogisticRegression(X_train.shape[1])
+    opt_w = optimizer_class(**optimizer_kwargs)
+    opt_b = optimizer_class(**optimizer_kwargs)
+    losses = []
+
+    for epoch in range(EPOCHS):
+        y_pred = model.forward(X_train)
+        loss = cross_entropy_loss(y_train, y_pred)
+        losses.append(loss)
+
+        dw, db = model.grads(X_train, y_train, y_pred)
+        model.w = opt_w.update(model.w, dw)
+        model.b = opt_b.update(model.b, db)
+
+    # Final test accuracy
+    y_test_pred = (model.forward(X_test) > 0.5).astype(int)
+    acc = accuracy_score(y_test, y_test_pred)
+    return losses, acc
+
+# Run experiments
+loss_tfgd, acc_tfgd = train_model(TFGDOptimizer, {'alpha': ALPHA, 'lambd': LAMBDA})
+loss_adam, acc_adam = train_model(AdamOptimizer, {'lr': 0.001})
+loss_rms, acc_rms = train_model(RMSpropOptimizer, {'lr': 0.001, 'decay': 0.9})
+
+# Print results
+print(f"TFGD (α={ALPHA}, λ={LAMBDA}) Test Accuracy: {acc_tfgd:.4f}")
+print(f"Adam Test Accuracy: {acc_adam:.4f}")
+print(f"RMSprop Test Accuracy: {acc_rms:.4f}")
+
+# Plotting
+plt.figure(figsize=(10, 5))
+plt.plot(loss_tfgd, label='TFGD', linestyle='--')
+plt.plot(loss_adam, label='Adam', linestyle='-')
+plt.plot(loss_rms, label='RMSprop', linestyle=':')
+plt.xlabel('Epochs')
+plt.ylabel('Cross-Entropy Loss')
+plt.legend()
+plt.tight_layout()
+plt.savefig('figures/adaptive_curves.png', dpi=300)
+plt.show()
 
 
 
