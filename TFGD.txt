@@ -578,5 +578,134 @@ plt.tight_layout()
 plt.savefig('figures/adaptive_curves.png', dpi=300)
 plt.show()
 
+#-------------------Non Convex analysis
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from tensorflow.keras.datasets import mnist
+
+# Ensure the output directory exists
+os.makedirs('figures', exist_ok=True)
+
+# Load MNIST data
+(x_train, _), _ = mnist.load_data()
+x_train = x_train.astype('float32') / 255.0
+x_train = x_train.reshape((x_train.shape[0], -1))  # flatten to (60000, 784)
+
+# Hyperparameters
+input_dim = x_train.shape[1]
+hidden_dim = 128
+epochs = 50
+learning_rate = 0.01
+
+# Activation and loss functions
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+def sigmoid_deriv(x):
+    s = sigmoid(x)
+    return s * (1 - s)
+
+def mse_loss(x_true, x_pred):
+    return np.mean((x_true - x_pred) ** 2)
+
+# Optimizers
+class TFGDOptimizer:
+    def __init__(self, alpha, lambd):
+        self.alpha = alpha
+        self.lambd = lambd
+        self.S = None
+
+    def update(self, params, grads):
+        if self.S is None:
+            self.S = np.zeros_like(params)
+        self.S = grads + np.exp(-self.lambd) * self.S
+        return params - learning_rate * self.S
+
+class AdamOptimizer:
+    def __init__(self, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m = None
+        self.v = None
+        self.t = 0
+
+    def update(self, params, grads):
+        if self.m is None:
+            self.m = np.zeros_like(grads)
+            self.v = np.zeros_like(grads)
+        self.t += 1
+        self.m = self.beta1 * self.m + (1 - self.beta1) * grads
+        self.v = self.beta2 * self.v + (1 - self.beta2) * (grads ** 2)
+        m_hat = self.m / (1 - self.beta1 ** self.t)
+        v_hat = self.v / (1 - self.beta2 ** self.t)
+        return params - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+# Training function for autoencoder
+def train_autoencoder(optimizer_class, opt_kwargs):
+    # Initialize weights and biases
+    W1 = np.random.randn(input_dim, hidden_dim) * 0.01
+    b1 = np.zeros(hidden_dim)
+    W2 = np.random.randn(hidden_dim, input_dim) * 0.01
+    b2 = np.zeros(input_dim)
+    
+    # Initialize optimizers
+    opt_W1 = optimizer_class(**opt_kwargs)
+    opt_b1 = optimizer_class(**opt_kwargs)
+    opt_W2 = optimizer_class(**opt_kwargs)
+    opt_b2 = optimizer_class(**opt_kwargs)
+    
+    losses = []
+    for epoch in range(1, epochs + 1):
+        # Forward pass
+        z1 = x_train.dot(W1) + b1
+        h = sigmoid(z1)
+        z2 = h.dot(W2) + b2
+        x_rec = sigmoid(z2)
+        
+        # Compute loss
+        loss = mse_loss(x_train, x_rec)
+        losses.append(loss)
+        
+        # Backpropagation
+        d_rec = (x_rec - x_train) * sigmoid_deriv(z2) / x_train.shape[0]
+        dW2 = h.T.dot(d_rec)
+        db2 = np.sum(d_rec, axis=0)
+        
+        dh = d_rec.dot(W2.T) * sigmoid_deriv(z1)
+        dW1 = x_train.T.dot(dh)
+        db1 = np.sum(dh, axis=0)
+        
+        # Update parameters
+        W2 = opt_W2.update(W2, dW2)
+        b2 = opt_b2.update(b2, db2)
+        W1 = opt_W1.update(W1, dW1)
+        b1 = opt_b1.update(b1, db1)
+    
+    return losses
+
+# Run training
+loss_tfgd = train_autoencoder(TFGDOptimizer, {'alpha': 0.6, 'lambd': 0.5})
+loss_adam = train_autoencoder(AdamOptimizer, {'lr': 0.001})
+
+# Print final losses
+print(f"Final reconstruction loss (TFGD): {loss_tfgd[-1]:.6f}")
+print(f"Final reconstruction loss (Adam): {loss_adam[-1]:.6f}")
+
+# Plotting
+plt.figure(figsize=(10, 5))
+plt.plot(loss_tfgd, label='TFGD', linestyle='--')
+plt.plot(loss_adam, label='Adam', linestyle='-')
+plt.xlabel('Epochs')
+plt.ylabel('MSE Reconstruction Loss')
+plt.legend()
+plt.tight_layout()
+plt.savefig('figures/nonconvex_mnist.png', dpi=300)
+plt.show()
+
+
 
 
