@@ -1,0 +1,683 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+TFGD-SmartGrid: Tempered Fractional Gradient Descent for Smart Grid Stability
+
+What this script does
+---------------------
+• Loads the UCI Electrical Grid Stability Simulated Data (CSV).
+• Drops 'stab' (continuous target) to avoid target leakage; predicts 'stabf'.
+• 5× outer StratifiedKFold. Tree base learners: RF, XGB, GB.
+• Builds OOF meta-features and trains a small MLP meta-learner with TFGD optimizer.
+• Computes metrics on each outer test fold: Accuracy, ROC-AUC, PR-AUC, Balanced Acc,
+  Negative Log-Likelihood, Brier Score, and (fixed) ECE.
+• Saves:
+    results/detailed_results.csv  -> per-sample: fold, model, y_true, y_score
+    results/results_summary.json  -> per-fold metrics per model
+
+Usage
+-----
+python tfgd_smartgrid_experiment.py --data Data_for_UCI_named.csv --outdir results
+"""
+
+import os
+import json
+import argparse
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score, average_precision_score,
+    balanced_accuracy_score, log_loss, brier_score_loss
+)
+from xgboost import XGBClassifier
+from scipy.special import binom
+
+
+# =========================
+# Configuration
+# =========================
+class Config:
+    """Configuration parameters for the experiment"""
+    # TFGD hyperparameters
+    TFGD_ALPHA = 0.6     # fractional order (0<α<1)
+    TFGD_LAMBDA = 0.5    # tempering parameter (λ>0)
+    TFGD_LEARNING_RATE = 0.1
+    TFGD_EPOCHS = 300
+
+    # CV
+    N_OUTER_FOLDS = 5
+    N_INNER_FOLDS = 5
+    RANDOM_STATE = 42
+
+    # File paths
+    DATA_PATH = 'Data_for_UCI_named.csv'
+    OUTPUT_DIR = 'results'
+
+    # Base model parameters
+    RF_PARAMS = dict(n_estimators=200, random_state=RANDOM_STATE, n_jobs=1)
+    XGB_PARAMS = dict(
+        n_estimators=300, learning_rate=0.05, max_depth=4,
+        subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+        random_state=RANDOM_STATE, n_jobs=1, eval_metric='logloss'
+    )
+    GB_PARAMS = dict(n_estimators=200, random_state=RANDOM_STATE)
+
+
+# =========================
+# TFGD Optimizer
+# =========================
+class TFGDOptimizer:
+    """
+    Tempered Fractional Gradient Descent (TFGD) optimizer (lightweight variant).
+    Update: S_k = C * grad_k + exp(-λ) * S_{k-1};  params <- params - lr * S_k
+    Here, C = binom(α, 0) = 1, so S_k = grad + exp(-λ)*S_{k-1}.
+    """
+    def __init__(self, alpha: float, lambd: float, lr: float = 0.1):
+        self.alpha = float(alpha)
+        self.lambd = float(lambd)
+        self.lr = float(lr)
+        self.S = None
+
+    def update(self, params: np.ndarray, grads: np.ndarray) -> np.ndarray:
+        if self.S is None:
+            self.S = np.zeros_like(params)
+        C0 = binom(self.alpha, 0)  # == 1.0
+        self.S = C0 * grads + np.exp(-self.lambd) * self.S
+        params -= self.lr * self.S
+        return params
+
+
+# =========================
+# Meta-learner (small MLP)
+# =========================
+class MetaMLP:
+    """A tiny MLP meta-learner trained with TFGD for stacking."""
+    def __init__(self, in_dim: int, hidden: int = 16, seed: int = 123):
+        rng = np.random.default_rng(seed)
+        self.W1 = rng.normal(0, 1/np.sqrt(in_dim), size=(in_dim, hidden))
+        self.b1 = np.zeros((1, hidden))
+        self.W2 = rng.normal(0, 1/np.sqrt(hidden), size=(hidden, 1))
+        self.b2 = np.zeros((1, 1))
+
+    def forward(self, X: np.ndarray) -> Tuple[np.ndarray, Dict]:
+        z1 = X @ self.W1 + self.b1
+        a1 = np.maximum(0, z1)             # ReLU
+        z2 = a1 @ self.W2 + self.b2
+        p = 1.0 / (1.0 + np.exp(-z2))      # Sigmoid
+        cache = {'X': X, 'z1': z1, 'a1': a1, 'z2': z2}
+        return p, cache
+
+    def backward(self, cache: Dict, y_true: np.ndarray, l2: float = 5e-4) -> List[np.ndarray]:
+        X, z1, a1, z2 = cache['X'], cache['z1'], cache['a1'], cache['z2']
+        m = y_true.shape[0]
+        p = 1.0 / (1.0 + np.exp(-z2))
+        dz2 = (p - y_true.reshape(-1, 1)) / m
+        dW2 = a1.T @ dz2 + l2 * self.W2
+        db2 = dz2.sum(0, keepdims=True)
+        da1 = dz2 @ self.W2.T
+        dz1 = da1 * (z1 > 0)              # ReLU derivative
+        dW1 = X.T @ dz1 + l2 * self.W1
+        db1 = dz1.sum(0, keepdims=True)
+        return [dW1, db1, dW2, db2]
+
+    def train_with_tfgd(self, X: np.ndarray, y: np.ndarray, epochs: int,
+                        alpha: float, lambd: float, lr: float, l2: float = 5e-4) -> List[float]:
+        opt_W1 = TFGDOptimizer(alpha, lambd, lr)
+        opt_b1 = TFGDOptimizer(alpha, lambd, lr)
+        opt_W2 = TFGDOptimizer(alpha, lambd, lr)
+        opt_b2 = TFGDOptimizer(alpha, lambd, lr)
+
+        losses = []
+        for _ in range(epochs):
+            p, cache = self.forward(X)
+            loss = -np.mean(y * np.log(p + 1e-8) + (1 - y) * np.log(1 - p + 1e-8))
+            losses.append(float(loss))
+            dW1, db1, dW2, db2 = self.backward(cache, y, l2)
+            self.W1 = opt_W1.update(self.W1, dW1)
+            self.b1 = opt_b1.update(self.b1, db1)
+            self.W2 = opt_W2.update(self.W2, dW2)
+            self.b2 = opt_b2.update(self.b2, db2)
+        return losses
+
+
+# =========================
+# Data utilities
+# =========================
+class DataLoader:
+    """Data loading and preprocessing utilities"""
+
+    @staticmethod
+    def load_smartgrid_data(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        df = pd.read_csv(file_path)
+        df.columns = [str(c).strip().strip('"') for c in df.columns]
+        X = df.drop(columns=['stabf'])
+        if 'stab' in X.columns:
+            X = X.drop(columns=['stab'])
+        X = X.values.astype(float)
+        y = (df['stabf'].astype(str).str.lower() == 'stable').astype(int).values
+        return X, y
+
+
+# =========================
+# Model factory & meta features
+# =========================
+class ModelFactory:
+    @staticmethod
+    def get_base_learners() -> List[Tuple[str, object]]:
+        return [
+            ('Random Forest',   RandomForestClassifier(**Config.RF_PARAMS)),
+            ('XGBoost',         XGBClassifier(**Config.XGB_PARAMS)),
+            ('Gradient Boosting', GradientBoostingClassifier(**Config.GB_PARAMS))
+        ]
+
+class MetaFeatureGenerator:
+    @staticmethod
+    def safe_logit(p: np.ndarray) -> np.ndarray:
+        EPS = 1e-9
+        p = np.clip(p, EPS, 1.0 - EPS)
+        return np.log(p / (1.0 - p))
+
+    @staticmethod
+    def generate_enhanced_meta_features(base_probs: np.ndarray) -> np.ndarray:
+        feats = []
+        # logits per model
+        logits = MetaFeatureGenerator.safe_logit(base_probs)
+        feats.append(logits)
+        # uncertainty features
+        prob_std = base_probs.std(axis=1, keepdims=True)
+        prob_max = base_probs.max(axis=1, keepdims=True)
+        prob_min = base_probs.min(axis=1, keepdims=True)
+        prob_rng = prob_max - prob_min
+        feats.extend([prob_std, prob_max, prob_min, prob_rng])
+        # agreement fraction
+        agree = (base_probs > 0.5).mean(axis=1, keepdims=True)
+        feats.append(agree)
+        return np.column_stack(feats)
+
+
+# =========================
+# Metrics (ECE fixed + proper scores)
+# =========================
+class EvaluationMetrics:
+    """Comprehensive evaluation metrics"""
+
+    @staticmethod
+    def ece_score(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> float:
+        y_true = y_true.astype(int)
+        y_prob = np.clip(y_prob, 1e-12, 1 - 1e-12)
+        bins = np.linspace(0.0, 1.0, n_bins + 1)
+        ece = 0.0
+        for i in range(n_bins):
+            lo, hi = bins[i], bins[i + 1]
+            if i < n_bins - 1:
+                mask = (y_prob >= lo) & (y_prob < hi)
+            else:
+                mask = (y_prob >= lo) & (y_prob <= hi)
+            if not np.any(mask):
+                continue
+            conf = y_prob[mask].mean()
+            frac_pos = y_true[mask].mean()
+            w = mask.mean()
+            ece += w * abs(frac_pos - conf)
+        return float(ece)
+
+    @staticmethod
+    def compute_all_metrics(y_true: np.ndarray, y_prob: np.ndarray, tag: str, fold: int) -> Dict:
+        y_prob = np.clip(y_prob, 1e-12, 1 - 1e-12)
+        y_pred = (y_prob >= 0.5).astype(int)
+        acc   = float(accuracy_score(y_true, y_pred))
+        roc   = float(roc_auc_score(y_true, y_prob))
+        ap    = float(average_precision_score(y_true, y_prob))
+        bacc  = float(balanced_accuracy_score(y_true, y_pred))
+        nll   = float(log_loss(y_true, y_prob))
+        brier = float(brier_score_loss(y_true, y_prob))
+        ece   = float(EvaluationMetrics.ece_score(y_true, y_prob, n_bins=15))
+        return {
+            'fold': fold, 'tag': tag,
+            'acc': acc, 'auc': roc, 'ap': ap,
+            'balanced_acc': bacc, 'nll': nll, 'brier': brier, 'ece': ece
+        }
+
+
+# =========================
+# (SmartGridExperiment class already defined above)
+# =========================
+
+def main():
+    parser = argparse.ArgumentParser(description="TFGD-SmartGrid Experiment Runner")
+    parser.add_argument('--data', type=str, default=Config.DATA_PATH,
+                        help='Path to UCI CSV (with stabf)')
+    parser.add_argument('--outdir', type=str, default=Config.OUTPUT_DIR,
+                        help='Output directory for results/')
+    # ✅ FIX: ignore unknown args injected by Jupyter/Colab
+    args, _ = parser.parse_known_args()
+
+    exp = SmartGridExperiment(data_path=args.data, outdir=args.outdir)
+    exp.run()
+
+
+if __name__ == "__main__":
+    main()
+
+# =========================
+# Visualization (graphics)
+# =========================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Paper figures for TFGD-SmartGrid
+
+Consumes:
+  --predictions results/detailed_results.csv   (per-sample: fold, model, y_true, y_score)
+  --summary     results/results_summary.json   (per-fold: dict[model][fold]->metrics)
+
+Produces (PNG + PDF):
+  1) fig1_roc_pr_curves
+  2) fig2_reliability_diagrams
+  3) fig3_foldwise_differences
+  4) fig4_risk_coverage
+  5) fig5_means_ci
+  6) fig6_scatter_tfgd_vs_voting
+
+Usage:
+  python make_paper_figures.py --predictions results/detailed_results.csv \
+                               --summary results/results_summary.json \
+                               --outdir figures
+"""
+
+import os
+import json
+import argparse
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# Try sklearn; we have fallbacks if not
+try:
+    from sklearn.metrics import roc_auc_score, average_precision_score, balanced_accuracy_score, log_loss, brier_score_loss
+    from sklearn.calibration import calibration_curve
+    HAVE_SK = True
+except Exception:
+    HAVE_SK = False
+    calibration_curve = None
+
+# -----------------------------
+# Utils
+# -----------------------------
+def ensure_outdirs(base: str):
+    os.makedirs(base, exist_ok=True)
+    os.makedirs(os.path.join(base, 'camera_ready'), exist_ok=True)
+
+def find_col(df: pd.DataFrame, candidates: List[str], required: bool=True):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise KeyError(f"Missing columns; expected one of: {candidates}")
+    return None
+
+def ece_score(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> float:
+    y_true = y_true.astype(int)
+    y_prob = np.clip(y_prob, 1e-12, 1-1e-12)
+    bins = np.linspace(0,1,n_bins+1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i+1]
+        if i < n_bins-1:
+            mask = (y_prob >= lo) & (y_prob < hi)
+        else:
+            mask = (y_prob >= lo) & (y_prob <= hi)
+        if not np.any(mask):
+            continue
+        conf = y_prob[mask].mean()
+        frac_pos = y_true[mask].mean()
+        w = mask.mean()
+        ece += w * abs(frac_pos - conf)
+    return float(ece)
+
+def load_predictions(pred_path: str) -> pd.DataFrame:
+    df = pd.read_csv(pred_path)
+    fold_col  = find_col(df, ['fold', 'outer_fold', 'cv_fold', 'kfold'])
+    model_col = find_col(df, ['model', 'estimator', 'method', 'learner', 'name'])
+    y_col     = find_col(df, ['y_true', 'label', 'y', 'target'])
+    score_col = find_col(df, ['y_score', 'proba', 'y_proba', 'pred_proba', 'score', 'p1', 'prob_positive'])
+    out = df[[fold_col, model_col, y_col, score_col]].copy()
+    out.columns = ['fold', 'model', 'y_true', 'y_score']
+    try:
+        out['fold'] = out['fold'].astype(int)
+    except Exception:
+        out['fold'] = out['fold'].astype(str).str.extract(r'(\d+)').astype(int)
+    return out
+
+def try_glob_predictions() -> pd.DataFrame:
+    for base in ['.', './results', './output', './outputs']:
+        for name in ['detailed_results.csv', 'predictions.csv', 'predictions_concat.csv']:
+            p = os.path.join(base, name)
+            if os.path.isfile(p):
+                try:
+                    return load_predictions(p)
+                except Exception:
+                    pass
+    return None
+
+def normalize_model_name(s: str) -> str:
+    s0 = s.strip().lower().replace(' ', '_')
+    if 'tfgd' in s0 and 'stack' in s0: return 'tfgd_stacking'
+    if 'stack_tfgd' in s0:              return 'tfgd_stacking'
+    if 'soft' in s0 and 'vot' in s0:    return 'soft_voting'
+    if 'vot' in s0:                     return 'soft_voting'
+    if 'xgb' in s0:                     return 'individual_xgb'
+    if 'random' in s0 or 'rf' in s0:    return 'individual_rf'
+    if 'grad' in s0 and 'boost' in s0:  return 'individual_gb'
+    return s0
+
+COLORS = {
+    'tfgd_stacking': '#1f77b4',
+    'soft_voting':   '#d62728',
+    'individual_xgb':'#2ca02c',
+    'individual_rf': '#8c564b',
+    'individual_gb': '#9467bd',
+}
+NAME_MAP = {
+    'tfgd_stacking': 'TFGD Stacking',
+    'soft_voting':   'Voting Ensemble',
+    'individual_xgb':'XGBoost',
+    'individual_rf': 'Random Forest',
+    'individual_gb': 'Gradient Boosting',
+}
+
+def aggregate_by_fold(pred_df: pd.DataFrame, models_keep: List[str]) -> Dict[str, Dict[int, Dict[str, float]]]:
+    def pack(y, p):
+        y = y.astype(int); p = np.clip(p, 1e-12, 1-1e-12)
+        yhat = (p>=0.5).astype(int)
+        acc = (yhat==y).mean()
+        if HAVE_SK:
+            try: roc = roc_auc_score(y, p)
+            except: roc = np.nan
+            try: pr  = average_precision_score(y, p)
+            except: pr = np.nan
+            try: bacc= balanced_accuracy_score(y, yhat)
+            except: bacc = np.nan
+            try: nll = log_loss(y, p)
+            except: nll = -(y*np.log(p)+(1-y)*np.log(1-p)).mean()
+            try: brier = brier_score_loss(y, p)
+            except: brier = ((p-y)**2).mean()
+        else:
+            roc = pr = bacc = np.nan
+            nll = -(y*np.log(p)+(1-y)*np.log(1-p)).mean()
+            brier = ((p-y)**2).mean()
+        ece = ece_score(y, p, n_bins=15)
+        return dict(accuracy=float(acc), roc_auc=float(roc), pr_auc=float(pr),
+                    balanced_accuracy=float(bacc), nll=float(nll), brier=float(brier), ece=float(ece))
+
+    out = {m:{} for m in models_keep}
+    for (fold, model), grp in pred_df.groupby(['fold','model']):
+        if model not in models_keep:
+            continue
+        met = pack(grp['y_true'].values, grp['y_score'].values)
+        out[model][int(fold)] = met
+    return out
+
+def save_fig(fig, outdir: str, basename: str):
+    fig.savefig(os.path.join(outdir, f"{basename}.png"), dpi=300, bbox_inches='tight')
+    fig.savefig(os.path.join(outdir, 'camera_ready', f"{basename}.pdf"), dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+# -----------------------------
+# Figures
+# -----------------------------
+def fig_roc_pr(pred_df: pd.DataFrame, outdir: str):
+    grid = np.linspace(0, 1, 101)
+    models = [m for m in pred_df['model'].unique() if m in ['tfgd_stacking','soft_voting']]
+    if not models: return
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    for m in models:
+        tprs_all, prs_all = [], []
+        for _, grp in pred_df[pred_df['model']==m].groupby('fold'):
+            y = grp['y_true'].values.astype(int)
+            s = grp['y_score'].values
+            order = np.argsort(-s)
+            y_sorted = y[order]
+            tp = np.cumsum(y_sorted); fp = np.cumsum(1 - y_sorted)
+            tp = np.insert(tp, 0, 0);  fp = np.insert(fp, 0, 0)
+            tpr = tp / max(tp[-1], 1); fpr = fp / max(fp[-1], 1)
+            tprs_all.append(np.interp(grid, fpr, tpr))
+            precision = tp / np.maximum(tp + fp, 1)
+            recall = tp / max(tp[-1], 1)
+            precision = np.maximum.accumulate(precision[::-1])[::-1]
+            prs_all.append(np.interp(grid, recall, precision))
+        mean_tpr = np.nanmean(np.vstack(tprs_all), axis=0)
+        std_tpr  = np.nanstd(np.vstack(tprs_all), axis=0)
+        mean_pr  = np.nanmean(np.vstack(prs_all), axis=0)
+        std_pr   = np.nanstd(np.vstack(prs_all), axis=0)
+        ax[0].plot(grid, mean_tpr, color=COLORS[m], label=NAME_MAP[m], lw=2)
+        ax[0].fill_between(grid, np.maximum(mean_tpr-std_tpr,0), np.minimum(mean_tpr+std_tpr,1), color=COLORS[m], alpha=0.2)
+        ax[1].plot(grid, mean_pr, color=COLORS[m], label=NAME_MAP[m], lw=2)
+        ax[1].fill_between(grid, np.maximum(mean_pr-std_pr,0), np.minimum(mean_pr+std_pr,1), color=COLORS[m], alpha=0.2)
+
+    ax[0].plot([0,1],[0,1],'k--',lw=1,alpha=0.6)
+    ax[0].set_title('ROC (mean ±1 SD across folds)'); ax[0].set_xlabel('False Positive Rate'); ax[0].set_ylabel('True Positive Rate'); ax[0].legend(loc='lower right')
+    ax[1].set_title('Precision–Recall (mean ±1 SD)'); ax[1].set_xlabel('Recall'); ax[1].set_ylabel('Precision'); ax[1].legend(loc='lower left')
+    save_fig(fig, outdir, 'fig1_roc_pr_curves')
+
+def fig_reliability(pred_df: pd.DataFrame, outdir: str):
+    models = [m for m in pred_df['model'].unique() if m in ['tfgd_stacking','soft_voting']]
+    if not models: return
+    fig, axes = plt.subplots(1, len(models), figsize=(6*len(models), 5), sharey=True)
+    if len(models)==1: axes=[axes]
+    for ax, m in zip(axes, models):
+        y = pred_df[pred_df['model']==m]['y_true'].values.astype(int)
+        p = pred_df[pred_df['model']==m]['y_score'].values
+        if calibration_curve is not None:
+            prob_true, prob_pred = calibration_curve(y, p, n_bins=15, strategy='uniform')
+            ece = ece_score(y, p, n_bins=15)
+            ax.plot([0,1],[0,1],'k--',alpha=0.6)
+            ax.plot(prob_pred, prob_true, 'o-', color=COLORS[m], label=f"{NAME_MAP[m]} (ECE={ece:.3f})")
+        else:
+            ece = ece_score(y, p, n_bins=15)
+            # manual bins
+            bins = np.linspace(0,1,16)
+            idx = np.digitize(p, bins) - 1
+            conf = []; acc = []
+            for b in range(15):
+                mask = (idx==b)
+                conf.append(p[mask].mean() if np.any(mask) else np.nan)
+                acc.append(y[mask].mean() if np.any(mask) else np.nan)
+            ax.plot([0,1],[0,1],'k--',alpha=0.6)
+            ax.plot(conf, acc, 'o-', color=COLORS[m], label=f"{NAME_MAP[m]} (ECE={ece:.3f})")
+        ax.set_title(f"Reliability – {NAME_MAP[m]}"); ax.set_xlabel('Predicted probability'); ax.set_xlim(0,1); ax.set_ylim(0,1); ax.grid(alpha=0.3); ax.legend(loc='upper left')
+    axes[0].set_ylabel('Observed frequency')
+    save_fig(fig, outdir, 'fig2_reliability_diagrams')
+
+def fig_violin_fold_diffs(per_fold: Dict[str, Dict[int, Dict[str, float]]], outdir: str):
+    # aliases
+    if 'voting_ensemble' in per_fold and 'soft_voting' not in per_fold:
+        per_fold['soft_voting'] = per_fold['voting_ensemble']
+    if 'stack_tfgd_enhanced' in per_fold and 'tfgd_stacking' not in per_fold:
+        per_fold['tfgd_stacking'] = per_fold['stack_tfgd_enhanced']
+    if not ('tfgd_stacking' in per_fold and 'soft_voting' in per_fold): return
+
+    folds = sorted(set(per_fold['tfgd_stacking'].keys()) & set(per_fold['soft_voting'].keys()))
+    if not folds: return
+    metrics = [('accuracy','Accuracy'), ('roc_auc','ROC-AUC'), ('pr_auc','PR-AUC'),
+               ('balanced_accuracy','Balanced Acc'), ('nll','NLL (↓)'), ('brier','Brier (↓)'), ('ece','ECE (↓)')]
+
+    data = {lab: [] for _, lab in metrics}
+    for f in folds:
+        t = per_fold['tfgd_stacking'][f]; v = per_fold['soft_voting'][f]
+        for key, lab in metrics:
+            if key in t and key in v:
+                data[lab].append(t[key] - v[key])
+
+    fig, ax = plt.subplots(figsize=(10,5))
+    labels = list(data.keys())
+    vals = [data[k] for k in labels]
+    ax.violinplot(vals, showmeans=True, showmedians=True, showextrema=True)
+    ax.axhline(0, color='k', lw=1, ls='--', alpha=0.5)
+    ax.set_xticks(np.arange(1, len(labels)+1)); ax.set_xticklabels(labels, rotation=20)
+    ax.set_ylabel('TFGD − Voting (absolute difference)')
+    ax.set_title('Fold-wise paired differences (TFGD vs Voting)')
+    save_fig(fig, outdir, 'fig3_foldwise_differences')
+
+def fig_risk_coverage(pred_df: pd.DataFrame, outdir: str):
+    models = [m for m in pred_df['model'].unique() if m in ['tfgd_stacking','soft_voting']]
+    if not models: return
+    taus = np.linspace(0.5, 1.0, 51)
+    fig, ax = plt.subplots(figsize=(6.5,5))
+    for m in models:
+        sub = pred_df[pred_df['model']==m]
+        y = sub['y_true'].values.astype(int)
+        p = sub['y_score'].values
+        conf = np.maximum(p, 1-p)
+        risks = []; covs = []
+        for t in taus:
+            keep = conf >= t
+            cov = np.mean(keep)
+            if cov == 0:
+                risk = np.nan
+            else:
+                yhat = (p >= 0.5).astype(int)
+                risk = 1.0 - (yhat[keep] == y[keep]).mean()
+            covs.append(cov); risks.append(risk)
+        ax.plot(covs, risks, label=NAME_MAP[m], color=COLORS[m], lw=2)
+    ax.set_xlabel('Coverage (fraction predictions issued)'); ax.set_ylabel('Risk = 1 − Accuracy on covered set')
+    ax.set_title('Risk–Coverage (selective classification)'); ax.invert_xaxis(); ax.legend(); ax.grid(alpha=0.3)
+    save_fig(fig, outdir, 'fig4_risk_coverage')
+
+def fig_means_ci(per_fold: Dict[str, Dict[int, Dict[str, float]]], outdir: str):
+    metrics = [('accuracy','Accuracy'), ('roc_auc','ROC-AUC'), ('pr_auc','PR-AUC'),
+               ('balanced_accuracy','Balanced Acc'), ('nll','NLL (↓)'), ('brier','Brier (↓)'), ('ece','ECE (↓)')]
+    models_order = ['tfgd_stacking','soft_voting','individual_xgb','individual_rf','individual_gb']
+    rows = []
+    for m in [mm for mm in models_order if mm in per_fold]:
+        vals = per_fold[m]
+        for key, lab in metrics:
+            v = [vals[f][key] for f in sorted(vals) if key in vals[f]]
+            if not v: continue
+            arr = np.asarray(v, float)
+            mu = float(np.nanmean(arr))
+            se = float(np.nanstd(arr, ddof=1)/np.sqrt(len(arr)))
+            ci = 1.96*se
+            rows.append({'model': NAME_MAP.get(m,m), 'metric': lab, 'mean': mu, 'ci': ci})
+    if not rows: return
+    df = pd.DataFrame(rows)
+    metrics_order = [lab for _, lab in metrics if lab in df['metric'].unique()]
+    fig, axes = plt.subplots(1, len(metrics_order), figsize=(5*len(metrics_order),4), sharey=False)
+    if len(metrics_order)==1: axes=[axes]
+    for ax, met in zip(axes, metrics_order):
+        sub = df[df['metric']==met]
+        order = ['TFGD Stacking','Voting Ensemble','XGBoost','Random Forest','Gradient Boosting']
+        order = [o for o in order if o in sub['model'].unique()]
+        sub = sub.set_index('model').loc[order].reset_index()
+        x = np.arange(len(sub))
+        colors = ['#1f77b4' if 'TFGD' in m else '#d62728' if 'Voting' in m else '#7f7f7f' for m in sub['model']]
+        ax.bar(x, sub['mean'], yerr=sub['ci'], capsize=4, color=colors)
+        ax.set_xticks(x); ax.set_xticklabels(sub['model'], rotation=20); ax.set_title(met); ax.grid(alpha=0.3, axis='y')
+        ax.set_ylabel('Lower is better' if '(↓)' in met else 'Higher is better')
+    save_fig(fig, outdir, 'fig5_means_ci')
+
+def fig_scatter_tfgd_vs_voting(per_fold: Dict[str, Dict[int, Dict[str, float]]], outdir: str):
+    # aliases
+    if 'voting_ensemble' in per_fold and 'soft_voting' not in per_fold:
+        per_fold['soft_voting'] = per_fold['voting_ensemble']
+    if 'tfgd_stacking' not in per_fold: return
+    if 'soft_voting' not in per_fold: return
+    folds = sorted(set(per_fold['tfgd_stacking'].keys()) & set(per_fold['soft_voting'].keys()))
+    if not folds: return
+    metrics = [('pr_auc','PR-AUC'), ('balanced_accuracy','Balanced Acc')]
+    fig, axes = plt.subplots(1, len(metrics), figsize=(5*len(metrics),4))
+    if len(metrics)==1: axes=[axes]
+    for ax, (key, lab) in zip(axes, metrics):
+        x = [per_fold['soft_voting'][f][key] for f in folds]
+        y = [per_fold['tfgd_stacking'][f][key] for f in folds]
+        lim_min = min(x+y); lim_max = max(x+y)
+        ax.plot([lim_min, lim_max],[lim_min, lim_max],'k--',lw=1)
+        ax.scatter(x, y, c='#1f77b4', s=60)
+        ax.set_xlabel('Voting Ensemble'); ax.set_ylabel('TFGD Stacking'); ax.set_title(f'Per-fold {lab}: TFGD vs Voting'); ax.grid(alpha=0.3)
+    save_fig(fig, outdir, 'fig6_scatter_tfgd_vs_voting')
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser(description='Generate paper figures for TFGD-SmartGrid.')
+    parser.add_argument('--predictions', type=str, default=None, help='CSV per-sample predictions')
+    parser.add_argument('--summary', type=str, default=None, help='JSON per-fold metrics')
+    parser.add_argument('--outdir', type=str, default='figures', help='Figures output directory')
+    args, _ = parser.parse_known_args()
+
+    ensure_outdirs(args.outdir)
+
+    # Load predictions
+    pred_df = None
+    if args.predictions and os.path.isfile(args.predictions):
+        pred_df = load_predictions(args.predictions)
+    else:
+        pred_df = try_glob_predictions()
+
+    if pred_df is not None and len(pred_df) > 0:
+        pred_df['model'] = pred_df['model'].apply(normalize_model_name)
+    else:
+        print('[INFO] No detailed predictions found. Some figures will be skipped.')
+
+    # Load per-fold metrics
+    per_fold = {}
+    summ = None
+    if args.summary and os.path.isfile(args.summary):
+        with open(args.summary, 'r') as f:
+            summ = json.load(f)
+    else:
+        for base in ['.', './results', './output', './outputs']:
+            p = os.path.join(base, 'results_summary.json')
+            if os.path.isfile(p):
+                with open(p, 'r') as f:
+                    summ = json.load(f)
+                break
+    if isinstance(summ, dict):
+        for mk, v in summ.items():
+            mk_norm = normalize_model_name(mk)
+            if isinstance(v, dict):
+                per_fold[mk_norm] = {}
+                for fold_str, met in v.items():
+                    try:
+                        f_id = int(fold_str)
+                        if isinstance(met, dict):
+                            per_fold[mk_norm][f_id] = {k: float(met[k]) for k in met if isinstance(met[k], (int, float))}
+                    except Exception:
+                        continue
+    else:
+        print('[INFO] No per-fold metrics found.')
+
+    # Figures
+    if pred_df is not None and len(pred_df) > 0:
+        fig_roc_pr(pred_df, args.outdir)
+        fig_reliability(pred_df, args.outdir)
+        fig_risk_coverage(pred_df, args.outdir)
+    else:
+        print('[INFO] Skipping ROC/PR, reliability, risk–coverage (no detailed predictions).')
+
+    if per_fold:
+        fig_violin_fold_diffs(per_fold, args.outdir)
+        fig_means_ci(per_fold, args.outdir)
+        fig_scatter_tfgd_vs_voting(per_fold, args.outdir)
+    else:
+        print('[INFO] Skipping violin/bar/scatter (no per-fold metrics).')
+
+    print(f"[DONE] Figures saved to: {args.outdir} and {os.path.join(args.outdir, 'camera_ready')}")
+
+
+if __name__ == '__main__':
+    main()
+
+
