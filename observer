@@ -1,0 +1,570 @@
+
+# ---------- constant fault ----------
+
+r"""
+OSL Adaptive Observer + Plant-based Parameter Identifier (Exact Tracking, Constant Faults)
+
+Goal:
+- Achieve exact parameter tracking for constant faults (dot(theta) ≡ 0).
+- Use a dedicated identifier for theta from the plant's linear regression:
+      y := x_dot - A0 x - B0 u - D phi(Fx) = Φ(theta),  Φ = [A1 x + B1 u,  A2 x + B2 u, ...]
+- Feed the identified theta_hat into the observer for state estimation.
+
+Notes:
+- Nonlinearity: phi(Fx) = tanh(Fx) (global OSL).
+- Observer uses P = C^T Z C with Z = I (exact cross-term cancellation for the Lyapunov proof).
+- No leakage in the identifier (lam_id=0) to avoid parameter bias (constant faults).
+- Rich multi-tone input and sufficient identifier gain gamma_id ensure convergence.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---------- utilities ----------
+def sat_eps(v, eps=1e-1):
+    return np.tanh(v / eps)
+
+def rk4(f, t, y, dt):
+    k1 = f(t, y)
+    k2 = f(t + 0.5 * dt, y + 0.5 * dt * k1)
+    k3 = f(t + 0.5 * dt, y + 0.5 * dt * k2)
+    k4 = f(t + dt, y + dt * k3)
+    return y + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+def tail_bound(signal, frac=0.25):
+    N = signal.shape[0]
+    i0 = int((1.0 - frac) * N)
+    return float(np.mean(np.linalg.norm(signal[i0:, :], axis=1)))
+
+# ---------- dimensions ----------
+n = 3   # state
+m = 1   # input
+q = 2   # outputs measured
+p = 2   # fault parameters
+
+# ---------- plant matrices (Hurwitz A0 is fine) ----------
+A0 = np.array([[-0.8,  0.6,  0.0],
+               [-0.2, -0.7,  0.5],
+               [ 0.0, -0.3, -0.9]])
+
+A1 = np.array([[0.0, 0.0, 0.0],
+               [0.2, 0.0, 0.0],
+               [0.0, 0.2, 0.0]])
+
+A2 = np.array([[0.0, 0.0, 0.0],
+               [0.0, 0.1, 0.0],
+               [0.0, 0.0, 0.1]])
+
+B0 = np.array([[0.0],
+               [0.0],
+               [1.0]])
+B1 = np.array([[0.1],
+               [0.0],
+               [0.0]])
+B2 = np.array([[0.0],
+               [0.1],
+               [0.0]])
+
+D = 0.5 * np.eye(n)
+F = np.eye(n)
+
+C = np.array([[1.0, 0.0, 0.0],
+              [0.0, 1.0, 0.0]])
+
+# ---------- Lyapunov structure for the observer ----------
+Z = np.eye(q)
+P = C.T @ Z @ C  # = C^T Z C
+
+# ---------- observer gains ----------
+alpha_L = 6.0           # output injection
+Gamma   = 0.0 * C.T     # turn off sliding term to keep residuals informative for ID
+# (set to 1.0*C.T if you need robustness; here 0.0 makes parameter ID easier)
+
+# ---------- parameter identifier (plant-based) ----------
+# \dot theta_hat = -gamma_id * Phi^T (Phi theta_hat - y), with lam_id = 0
+gamma_id = 6.0           # identifier gain (increase for faster parameter convergence)
+lam_id   = 0.0           # NO leakage for constant-fault exact tracking
+use_projection_id = True
+theta_bounds_id   = np.array([2.0, 2.0])  # safety box
+def project_theta_id(th):
+    return np.clip(th, -theta_bounds_id, theta_bounds_id) if use_projection_id else th
+
+# ---------- observer's internal adaptive law is DISABLED (we use ID output) ----------
+# we only use theta_hat from the plant-based identifier in the observer dynamics.
+
+# ---------- input (rich multi-tone) ----------
+def u_fun(t):
+    return np.array([0.8*np.sin(0.5*t) + 0.6*np.sin(1.1*t + 0.3) + 0.4*np.sin(1.7*t + 0.8)])
+
+# ---------- constant faults ----------
+def theta_true(t):
+    return np.array([0.5, -0.3])
+
+# ---------- nonlinearity ----------
+def phi(z):
+    return np.tanh(z)
+
+# ---------- dynamics for joint system: y = [x; x_hat; theta_hat_id] ----------
+def dyn_joint(t, y):
+    x        = y[0:n]
+    x_hat    = y[n:2*n]
+    theta_id = y[2*n:2*n+p]   # identifier’s estimate
+
+    u_s = u_fun(t)[0]
+    th  = theta_true(t)       # true (constant)
+
+    # ----- Plant dynamics (uses true theta) -----
+    A_th    = A0 + th[0]*A1 + th[1]*A2
+    B_th_u  = (B0[:,0] + th[0]*B1[:,0] + th[1]*B2[:,0]) * u_s
+    x_dot   = A_th @ x + B_th_u + (D @ phi(F @ x))
+
+    # ----- Observer dynamics (uses theta_hat from identifier) -----
+    A_th_hat   = A0 + theta_id[0]*A1 + theta_id[1]*A2
+    B_thu_hat  = (B0[:,0] + theta_id[0]*B1[:,0] + theta_id[1]*B2[:,0]) * u_s
+    e_y        = (C @ x) - (C @ x_hat)
+    sm_term    = Gamma @ sat_eps(e_y, eps=1e-1)
+    x_hat_dot  = (A_th_hat @ x_hat
+                  + B_thu_hat
+                  + (D @ phi(F @ x_hat))
+                  + (alpha_L * C.T @ e_y)
+                  + sm_term)
+
+    # ----- Parameter ID dynamics from PLANT regression y = Phi theta -----
+    # y_id  := x_dot - A0 x - B0 u - D phi(Fx)      (n-vector)
+    # Phi   := [A1 x + B1 u,  A2 x + B2 u]          (n x p matrix)
+    y_id  = x_dot - (A0 @ x) - (B0[:,0] * u_s) - (D @ phi(F @ x))
+    psi1  = A1 @ x + B1[:,0] * u_s
+    psi2  = A2 @ x + B2[:,0] * u_s
+    Phi   = np.column_stack([psi1, psi2])          # (n x 2)
+
+    resid = (Phi @ theta_id) - y_id                # n-vector
+    theta_id_dot = -gamma_id * (Phi.T @ resid) - lam_id * theta_id
+
+    return np.hstack([x_dot, x_hat_dot, theta_id_dot])
+
+# ---------- simulate ----------
+def simulate(T=50.0, dt=1e-3, x0=None, xhat0=None, that0=None):
+    if x0 is None:
+        x0 = np.array([1.0, -0.6, 0.9])
+    if xhat0 is None:
+        xhat0 = np.array([0.2, 0.0, -0.2])
+    if that0 is None:
+        that0 = np.array([0.0, 0.0])
+
+    y = np.hstack([x0, xhat0, that0])
+
+    N = int(T / dt)
+    tgrid = np.linspace(0.0, T, N+1)
+
+    X      = np.zeros((N+1, n))
+    Xhat   = np.zeros((N+1, n))
+    Thhat  = np.zeros((N+1, p))   # identifier’s theta_hat
+    E      = np.zeros((N+1, n))
+    Eth    = np.zeros((N+1, p))
+
+    t = 0.0
+    for i in range(N+1):
+        x        = y[0:n]
+        x_hat    = y[n:2*n]
+        theta_id = y[2*n:2*n+p]
+        th_true  = theta_true(t)
+
+        X[i,:]      = x
+        Xhat[i,:]   = x_hat
+        Thhat[i,:]  = theta_id
+        E[i,:]      = x_hat - x
+        Eth[i,:]    = theta_id - th_true
+
+        # integrate
+        y_next = rk4(dyn_joint, t, y, dt)
+
+        # project theta_hat_id in a wide box (safety)
+        y_next[2*n:2*n+p] = project_theta_id(y_next[2*n:2*n+p])
+
+        # clip states
+        y_next[0:2*n] = np.clip(y_next[0:2*n], -80.0, 80.0)
+
+        y = y_next
+        t += dt
+
+    return tgrid, X, Xhat, Thhat, E, Eth
+
+# ---------- run & report ----------
+if __name__ == "__main__":
+    T  = 60.0     # give the ID time to converge
+    dt = 1e-3
+
+    t, X, Xh, Thh, E, Eth = simulate(T=T, dt=dt)
+
+    tail_e   = tail_bound(E, 0.25)
+    tail_eth = tail_bound(Eth, 0.25)
+
+    theta_T     = theta_true(T)
+    theta_hat_T = Thh[-1, :]
+    e_theta_T   = theta_hat_T - theta_T
+
+    print("\n=== Exact Parameter Tracking via Plant-based ID (Constant Faults) ===")
+    print("Tail averages over last 25%:")
+    print("  tail ||e||      = {:.4f}".format(tail_e))
+    print("  tail ||e_theta||= {:.4f}".format(tail_eth))
+    print("\nFinal parameters at t = T:")
+    print("  theta(T)        =", theta_T.tolist())
+    print("  theta_hat(T)    =", theta_hat_T.tolist())
+    print("  e_theta(T)      =", e_theta_T.tolist())
+
+    # Plots
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,2,1)
+    plt.plot(t, X, lw=1.5); plt.plot(t, Xh, '--', lw=1.2)
+    plt.title(r'States (solid) vs estimates (dashed)')
+    plt.xlabel(r't [s]'); plt.ylabel(r'x, \hat{x}')
+    plt.legend([r'$x_1$', r'$x_2$', r'$x_3$', r'$\hat{x}_1$', r'$\hat{x}_2$', r'$\hat{x}_3$'], ncol=2)
+
+    plt.subplot(1,2,2)
+    plt.plot(t, E, lw=1.5)
+    plt.title(r'State estimation error $e=\hat{x}-x$')
+    plt.xlabel(r't [s]'); plt.ylabel(r'$e$')
+    plt.legend([r'$e_1$', r'$e_2$', r'$e_3$'])
+
+    plt.tight_layout(); plt.show()
+
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,2,1)
+    th_true_traj = np.tile(theta_true(0.0), (len(t),1))  # constant fault trajectory
+    plt.plot(t, th_true_traj, lw=1.5); plt.plot(t, Thh, '--', lw=1.2)
+    plt.title(r'Parameters (solid) vs estimates (dashed)')
+    plt.xlabel(r't [s]'); plt.ylabel(r'$\theta,\ \hat{\theta}$')
+    plt.legend([r'$\theta_1$', r'$\theta_2$', r'$\hat{\theta}_1$', r'$\hat{\theta}_2$'], ncol=2)
+
+    plt.subplot(1,2,2)
+    plt.plot(t, Eth, lw=1.5)
+    plt.title(r'Parameter error $e_{\theta}=\hat{\theta}-\theta$')
+    plt.xlabel(r't [s]'); plt.ylabel(r'$e_{\theta}$')
+    plt.legend([r'$e_{\theta_1}$', r'$e_{\theta_2}$'])
+
+    plt.tight_layout(); plt.show()
+
+
+    # ---------- variable faults ----------
+
+    
+r"""
+Time-Varying Faults (UUB) – OSL Observer + Robust RLS with:
+  • SVD-based compression (use most energetic directions)
+  • ε-regularization, gain/step clipping, regressor-energy gating, exponential smoothing
+  • Soft (tangent) projection (no hard plateaus)
+  • Tiny dither in input to keep the second channel excited
+  • Scheduled observer injection alpha_L(t): enough stabilization, preserves residual for ID
+
+Author: Your Name
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# -------------------------
+# Utilities
+# -------------------------
+def sat_eps(v, eps=1e-1):
+    return np.tanh(v / eps)
+
+def rk4(f, t, y, dt):
+    k1 = f(t, y)
+    k2 = f(t + 0.5 * dt, y + 0.5 * dt * k1)
+    k3 = f(t + 0.5 * dt, y + 0.5 * dt * k2)
+    k4 = f(t + dt, y + dt * k3)
+    return y + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+def tail_bound(signal, frac=0.25):
+    N = signal.shape[0]
+    i0 = int((1.0 - frac) * N)
+    return float(np.mean(np.linalg.norm(signal[i0:, :], axis=1)))
+
+class DiffFilter:
+    """First-order differentiator for x: xdot_est = alpha*(x - x_prev)/dt + (1-alpha)*xdot_prev"""
+    def __init__(self, n, alpha=0.25):
+        self.n = n
+        self.alpha = alpha
+        self.x_prev = np.zeros(n)
+        self.xdot_prev = np.zeros(n)
+        self.first = True
+    def step(self, x, dt):
+        if self.first:
+            self.x_prev = x.copy()
+            self.xdot_prev = np.zeros(self.n)
+            self.first = False
+        xdot = self.alpha*(x - self.x_prev)/dt + (1.0 - self.alpha)*self.xdot_prev
+        self.x_prev = x.copy()
+        self.xdot_prev = xdot.copy()
+        return xdot
+
+# -------------------------
+# Dimensions & Matrices
+# -------------------------
+n = 3   # state
+q = 2   # measured outputs
+p = 2   # fault parameters
+
+A0 = np.array([[-0.8,  0.6,  0.0],
+               [-0.2, -0.7,  0.5],
+               [ 0.0, -0.3, -0.9]])
+
+A1 = np.array([[0.0, 0.0, 0.0],
+               [0.2, 0.0, 0.0],
+               [0.0, 0.2, 0.0]])
+
+A2 = np.array([[0.0, 0.0, 0.0],
+               [0.0, 0.1, 0.0],
+               [0.0, 0.0, 0.1]])
+
+B0 = np.array([[0.0],
+               [0.0],
+               [1.0]])
+B1 = np.array([[0.1],
+               [0.0],
+               [0.0]])
+B2 = np.array([[0.0],
+               [0.1],
+               [0.0]])
+
+D = 0.5 * np.eye(n)
+F = np.eye(n)
+
+C = np.array([[1.0, 0.0, 0.0],
+              [0.0, 1.0, 0.0]])
+
+Z = np.eye(q)
+Plyap = C.T @ Z @ C  # Lyapunov structure
+
+# -------------------------
+# Time-varying faults
+# -------------------------
+def theta_true(t):
+    return np.array([0.5 + 0.2*np.sin(0.2*t),
+                     -0.3 + 0.15*np.cos(0.15*t)])
+
+# -------------------------
+# Input: multi-tone + tiny dedicated dither for the B2/A2 channel
+# -------------------------
+USE_CHIRP = False
+def u_fun(t):
+    base  = 0.7*np.sin(0.4*t) + 0.4*np.sin(0.9*t)
+    dither= 0.12*np.sin(0.6*t + np.pi/4)   # small extra excitation
+    chirp = 0.0
+    return np.array([base + dither + chirp])
+
+# -------------------------
+# Scheduled observer injection: preserve residual for ID when e_y is small
+# -------------------------
+alpha_L_min, alpha_L_max = 4.5, 6.0
+def alpha_L_sched(e_y):
+    # e_y weighting: more injection when error is large, less when very small
+    norm = np.linalg.norm(e_y)
+    w = norm / (0.1 + norm)   # in (0,1)
+    return alpha_L_min + (alpha_L_max - alpha_L_min) * w
+
+Gamma = 0.4 * C.T  # gentle saturation
+
+# -------------------------
+# Robust RLS parameters
+# -------------------------
+lambda_rls   = 0.995    # forgetting factor
+delta0       = 600.0    # covariance scale
+den_eps      = 1e-3     # stronger ε to avoid tiny denominators
+K_clip       = 0.025    # clip max |K_i|
+phi_min      = 8e-3     # energy gate
+dtheta_clip  = 0.008    # per-sample increment
+alpha_smooth = 0.6      # exponential smoothing on update
+
+# Tangent projection (very wide box: avoids flat plateaus)
+theta_bounds_id = np.array([10.0, 10.0])
+
+def tangent_projection(theta, dtheta, theta_max):
+    """Remove outward normal component on active faces; keep tangential motion."""
+    tol = 1e-6
+    dproj = dtheta.copy()
+    for k in range(len(theta)):
+        if abs(theta[k]) >= theta_max[k] - tol and np.sign(theta[k]) * dtheta[k] > 0:
+            dproj[k] = 0.0
+    return dproj
+
+# Differentiator toggle (for noisy runs)
+USE_TRUE_XDOT = True
+
+# -------------------------
+# Simulation
+# -------------------------
+def simulate(T=40.0, dt=1e-3, x0=None, xhat0=None, that0=None, use_filter=False):
+    if x0 is None:    x0    = np.array([1.0, -0.6, 0.9])
+    if xhat0 is None: xhat0 = np.array([0.2, 0.0, -0.2])
+    if that0 is None: that0 = np.array([0.0, 0.0])
+
+    y = np.hstack([x0, xhat0, that0])
+    df = DiffFilter(n, alpha=0.25) if use_filter else None
+
+    # RLS state
+    P = delta0 * np.eye(p)
+    theta_id = that0.copy()
+
+    N = int(T / dt)
+    tgrid = np.linspace(0.0, T, N+1)
+
+    X      = np.zeros((N+1, n))
+    Xhat   = np.zeros((N+1, n))
+    Thhat  = np.zeros((N+1, p))
+    E      = np.zeros((N+1, n))
+    Eth    = np.zeros((N+1, p))
+
+    t = 0.0
+    for i in range(N+1):
+        x        = y[0:n]
+        x_hat    = y[n:2*n]
+
+        th_true  = theta_true(t)
+        u_s      = u_fun(t)[0]
+
+        # record
+        X[i,:]      = x
+        Xhat[i,:]   = x_hat
+        Thhat[i,:]  = theta_id
+        E[i,:]      = x_hat - x
+        Eth[i,:]    = theta_id - th_true
+
+        # Plant RHS
+        A_th   = A0 + th_true[0]*A1 + th_true[1]*A2
+        B_th_u = (B0[:,0] + th_true[0]*B1[:,0] + th_true[1]*B2[:,0]) * u_s
+        x_dot  = A_th @ x + B_th_u + (D @ phi(F @ x))
+
+        # Regressor Phi and target y_id
+        psi1 = A1 @ x + B1[:,0] * u_s
+        psi2 = A2 @ x + B2[:,0] * u_s
+        Phi  = np.column_stack([psi1, psi2])       # (n x p)
+
+        if USE_TRUE_XDOT and not use_filter:
+            xdot_est = x_dot
+        else:
+            if df is None: df = DiffFilter(n, alpha=0.25)
+            xdot_est = df.step(x, dt)
+
+        y_id = xdot_est - (A0 @ x) - (B0[:,0] * u_s) - (D @ phi(F @ x))
+
+        # -------- Robust RLS with SVD compression --------
+        U, S, VT = np.linalg.svd(Phi, full_matrices=False)   # Phi = U S V^T
+        U_top = U[:, :p]                                   # (n x p)
+        Phi_c = U_top.T @ Phi                              # (p x p)
+        y_c   = U_top.T @ y_id                             # (p,)
+
+        phi_energy = np.linalg.norm(Phi_c)
+        if phi_energy >= phi_min:
+            for j in range(p):
+                phi_j = Phi_c[j, :].reshape(-1,1)          # (p x 1)
+                yj    = y_c[j]
+                denom = lambda_rls + (phi_j.T @ P @ phi_j).item() + den_eps
+                K     = (P @ phi_j) / denom
+                K     = np.clip(K, -K_clip, K_clip)
+                err   = yj - (phi_j.T @ theta_id).item()
+                dth   = (K.flatten() * err)
+                dth   = np.clip(dth, -dtheta_clip, dtheta_clip)
+                dth   = tangent_projection(theta_id, dth, theta_bounds_id)
+                dth   = alpha_smooth * dth
+                theta_id = theta_id + dth
+                P = (P - K @ (phi_j.T @ P)) / lambda_rls
+                P = 0.5 * (P + P.T)
+
+        # -------- Plant + observer with scheduled injection --------
+        def dyn_full(tt, yy):
+            x        = yy[0:n]
+            x_hat    = yy[n:2*n]
+            theta_id_local = theta_id
+
+            u_s = u_fun(tt)[0]
+            th  = theta_true(tt)
+
+            # plant
+            A_th   = A0 + th[0]*A1 + th[1]*A2
+            B_th_u = (B0[:,0] + th[0]*B1[:,0] + th[1]*B2[:,0]) * u_s
+            x_dot  = A_th @ x + B_th_u + (D @ phi(F @ x))
+
+            # observer (scheduled alpha_L)
+            e_y       = (C @ x) - (C @ x_hat)
+            alphaL    = alpha_L_sched(e_y)
+            A_th_hat  = A0 + theta_id_local[0]*A1 + theta_id_local[1]*A2
+            B_thu_hat = (B0[:,0] + theta_id_local[0]*B1[:,0] + theta_id_local[1]*B2[:,0]) * u_s
+            sm_term   = Gamma @ sat_eps(e_y, eps=1e-1)
+            x_hat_dot = (A_th_hat @ x_hat
+                         + B_thu_hat
+                         + (D @ phi(F @ x_hat))
+                         + (alphaL * C.T @ e_y)
+                         + sm_term)
+
+            return np.hstack([x_dot, x_hat_dot, np.zeros(p)])
+
+        # Put theta into state and integrate
+        y[2*n:2*n+p] = theta_id
+        y_next = rk4(dyn_full, t, y, dt)
+
+        # Clip states (safety net)
+        y_next[0:2*n] = np.clip(y_next[0:2*n], -80.0, 80.0)
+
+        y = y_next
+        t += dt
+
+    return tgrid, X, Xhat, Thhat, E, Eth
+
+# -------------------------
+# Run & report
+# -------------------------
+if __name__ == "__main__":
+    print("\n=== Time-Varying Faults (UUB) – Robust RLS + SVD + Soft Projection + Scheduled Injection ===")
+    T, dt = 40.0, 1e-3
+    t, X, Xh, Thh, E, Eth = simulate(T=T, dt=dt, use_filter=False)
+
+    tail_e   = tail_bound(E, 0.25)
+    tail_eth = tail_bound(Eth, 0.25)
+
+    def theta_true_vec(tt_array):
+        return np.vstack([theta_true(tt) for tt in tt_array])
+    theta_T     = theta_true(t[-1])
+    theta_hat_T = Thh[-1, :]
+    e_theta_T   = theta_hat_T - theta_T
+
+    print("Tail averages over last 25%:")
+    print("  tail ||e||      = {:.4f}".format(tail_e))
+    print("  tail ||e_theta||= {:.4f}".format(tail_eth))
+    print("\nFinal parameters at t = T:")
+    print("  theta(T)        =", theta_T.tolist())
+    print("  theta_hat(T)    =", theta_hat_T.tolist())
+    print("  e_theta(T)      =", e_theta_T.tolist())
+
+    # --- Plots ---
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,2,1)
+    plt.plot(t, theta_true_vec(t), lw=1.5)
+    plt.plot(t, Thh, '--', lw=1.2)
+    plt.title(r'Time-varying faults: parameters vs estimates (UUB)')
+    plt.xlabel(r't [s]'); plt.ylabel(r'$\theta,\ \hat{\theta}$')
+    plt.legend([r'$\theta_1$', r'$\theta_2$', r'$\hat{\theta}_1$', r'$\hat{\theta}_2$'], ncol=2)
+
+    plt.subplot(1,2,2)
+    plt.plot(t, Eth, lw=1.5)
+    plt.title(r'Parameter error $e_{\theta}=\hat{\theta}-\theta$ (UUB)')
+    plt.xlabel(r't [s]'); plt.ylabel(r'$e_{\theta}$')
+    plt.legend([r'$e_{\theta_1}$', r'$e_{\theta_2}$'])
+
+    plt.tight_layout(); plt.show()
+
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,2,1)
+    plt.plot(t, X, lw=1.5); plt.plot(t, Xh, '--', lw=1.2)
+    plt.title(r'Time-varying faults: states vs estimates')
+    plt.xlabel(r't [s]'); plt.ylabel(r'x, \hat{x}')
+    plt.legend([r'$x_1$', r'$x_2$', r'$x_3$', r'$\hat{x}_1$', r'$\hat{x}_2$', r'$\hat{x}_3$'], ncol=2)
+
+    plt.subplot(1,2,2)
+    plt.plot(t, E, lw=1.5)
+    plt.title(r'Time-varying faults: $e=\hat{x}-x$ (UUB)')
+    plt.xlabel(r't [s]'); plt.ylabel(r'$e$')
+    plt.legend([r'$e_1$', r'$e_2$', r'$e_3$'])
+
+    plt.tight_layout(); plt.show()
+
