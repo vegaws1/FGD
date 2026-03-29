@@ -1,0 +1,2115 @@
+# ============================================================
+# 5-SEED BENCHMARK AGGREGATION SCRIPT
+# ------------------------------------------------------------
+# Stable GRU-based Hammerstein benchmark runner
+#
+# Core design preserved from attached V6 family:
+# - GRU-only nonlinear block
+# - latent_dim = 2
+# - full-sequence training
+# - Stage-1 step-signal initialization
+# - Stage-2 random-signal training
+#
+# Strong synthetic benchmark mode:
+# - deterministic target = X (noise-free simulator output)
+# - measured-output tracking still evaluated on Y
+# - noise head still trained on residuals to Y
+#
+# New in this script:
+# - Run multiple seeds automatically
+# - Save per-seed metrics/results
+# - Aggregate mean ± std across seeds
+# ============================================================
+
+import os
+import json
+import csv
+import copy
+import random
+import warnings
+from dataclasses import dataclass, asdict
+from itertools import product
+from datetime import datetime
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import HuberRegressor
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# ============================================================
+# 1. Reproducibility / utilities
+# ============================================================
+
+def set_seed(seed: int = 1234):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float32
+
+def mse_np(y_true, y_pred):
+    return np.mean((y_true - y_pred) ** 2)
+
+def mae_np(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred))
+
+def rmse_np(y_true, y_pred):
+    return np.sqrt(mse_np(y_true, y_pred))
+
+def r2_np(y_true, y_pred):
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    return 1.0 - ss_res / (ss_tot + 1e-8)
+
+def nrmse_np(y_true, y_pred, eps=1e-8):
+    return rmse_np(y_true, y_pred) / (np.max(y_true) - np.min(y_true) + eps)
+
+def fit_percent_np(y_true, y_pred, eps=1e-8):
+    num = np.linalg.norm(y_true - y_pred)
+    den = np.linalg.norm(y_true - np.mean(y_true)) + eps
+    return max(0.0, 100.0 * (1.0 - num / den))
+
+def mape_np(y_true, y_pred, eps=1e-6):
+    denom = np.maximum(np.abs(y_true), eps)
+    return np.mean(np.abs((y_true - y_pred) / denom)) * 100.0
+
+def smape_np(y_true, y_pred, eps=1e-6):
+    denom = np.abs(y_true) + np.abs(y_pred) + eps
+    return 100.0 * np.mean(2.0 * np.abs(y_pred - y_true) / denom)
+
+def wmape_np(y_true, y_pred, eps=1e-6):
+    return 100.0 * np.sum(np.abs(y_true - y_pred)) / (np.sum(np.abs(y_true)) + eps)
+
+def relative_param_error(true_arr, est_arr, eps=1e-12):
+    true_arr = np.asarray(true_arr)
+    est_arr = np.asarray(est_arr)
+    return np.linalg.norm(est_arr - true_arr) / (np.linalg.norm(true_arr) + eps)
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+def save_json(obj, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+def save_csv_dicts(rows, path):
+    if len(rows) == 0:
+        return
+    all_keys = sorted({k for row in rows for k in row.keys()})
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in all_keys})
+
+# ============================================================
+# 2. Synthetic "true" MIMO Hammerstein plant
+# ============================================================
+
+@dataclass
+class PlantConfig:
+    in_dim: int = 2
+    latent_dim: int = 2
+    out_dim: int = 2
+    hidden_dim: int = 12
+    na: int = 2
+    nb: int = 2
+    noise_ar_order: int = 1
+    student_df: float = 5.0
+
+class TrueMIMOHammersteinPlant:
+    def __init__(self, cfg: PlantConfig):
+        self.cfg = cfg
+        p = cfg.in_dim
+        m = cfg.latent_dim
+        h = cfg.hidden_dim
+        rng = np.random.default_rng(2026)
+
+        self.Wu = rng.normal(0.0, 0.6, size=(h, p))
+        self.Wh = rng.normal(0.0, 0.35, size=(h, h))
+        self.bh = rng.normal(0.0, 0.15, size=(h,))
+        self.Wn1 = rng.normal(0.0, 0.5, size=(h, h))
+        self.bn1 = rng.normal(0.0, 0.1, size=(h,))
+        self.Wn2 = rng.normal(0.0, 0.5, size=(m, h))
+        self.bn2 = rng.normal(0.0, 0.1, size=(m,))
+
+        self.A = [
+            np.array([[0.34, -0.08],
+                      [0.05,  0.28]], dtype=np.float64),
+            np.array([[-0.10, 0.03],
+                      [ 0.02, -0.07]], dtype=np.float64),
+        ]
+        self.B = [
+            np.array([[ 0.80, 0.12],
+                      [-0.05, 0.55]], dtype=np.float64),
+            np.array([[ 0.20,-0.10],
+                      [ 0.08, 0.15]], dtype=np.float64),
+        ]
+
+        self.Phi = np.array([[0.65, 0.12],
+                             [0.08, 0.55]], dtype=np.float64)
+        self.chol = np.array([[0.12, 0.00],
+                              [0.04, 0.10]], dtype=np.float64)
+
+    def nonlinear_block(self, u_seq):
+        T, p = u_seq.shape
+        h = self.cfg.hidden_dim
+        m = self.cfg.latent_dim
+
+        h_t = np.zeros(h, dtype=np.float64)
+        n_seq = np.zeros((T, m), dtype=np.float64)
+
+        for t in range(T):
+            u_t = u_seq[t]
+            z = np.tanh(self.Wu @ u_t + self.Wh @ h_t + self.bh)
+            h_t = 0.70 * h_t + 0.30 * z
+            z2 = np.tanh(self.Wn1 @ h_t + self.bn1)
+
+            coupled = np.zeros(m, dtype=np.float64)
+            if m >= 2 and p >= 2:
+                coupled[0] = 0.18 * np.sin(u_t[0]) * u_t[1]
+                coupled[1] = 0.16 * np.cos(u_t[1]) * u_t[0]
+
+            n_t = self.Wn2 @ z2 + self.bn2 + coupled
+            n_seq[t] = n_t
+
+        return n_seq
+
+    def linear_dynamic_block(self, n_seq):
+        T, m = n_seq.shape
+        s = self.cfg.out_dim
+        x_hist = [np.zeros(s, dtype=np.float64) for _ in range(T)]
+
+        for t in range(T):
+            cur = np.zeros(s, dtype=np.float64)
+            for i in range(self.cfg.na):
+                if t - i - 1 >= 0:
+                    cur -= self.A[i] @ x_hist[t - i - 1]
+            for j in range(self.cfg.nb):
+                if t - j - 1 >= 0:
+                    cur += self.B[j] @ n_seq[t - j - 1]
+            x_hist[t] = cur
+
+        return np.stack(x_hist, axis=0)
+
+    def correlated_measurement_noise(self, T):
+        s = self.cfg.out_dim
+        df = self.cfg.student_df
+        eps = np.random.standard_t(df=df, size=(T, s)) @ self.chol.T
+        eta = np.zeros((T, s), dtype=np.float64)
+
+        for t in range(T):
+            cur = eps[t].copy()
+            if t - 1 >= 0:
+                cur += self.Phi @ eta[t - 1]
+            eta[t] = cur
+
+        return eta
+
+    def simulate(self, u_seq):
+        n_seq = self.nonlinear_block(u_seq)
+        x_seq = self.linear_dynamic_block(n_seq)
+        eta = self.correlated_measurement_noise(len(u_seq))
+        y_seq = x_seq + eta
+        return n_seq, x_seq, eta, y_seq
+
+# ============================================================
+# 3. Input generation
+# ============================================================
+
+def generate_step_sequence(T, in_dim=2, amp_low=-1.5, amp_high=1.5,
+                           min_hold=8, max_hold=20):
+    u = np.zeros((T, in_dim), dtype=np.float64)
+    t = 0
+    while t < T:
+        hold = np.random.randint(min_hold, max_hold + 1)
+        level = np.random.uniform(amp_low, amp_high, size=(in_dim,))
+        u[t:min(T, t + hold)] = level
+        t += hold
+    return u
+
+def generate_random_sequence(T, in_dim=2, smooth=True):
+    u = np.random.uniform(-1.6, 1.6, size=(T, in_dim)).astype(np.float64)
+    if smooth:
+        for k in range(in_dim):
+            for t in range(1, T):
+                u[t, k] = 0.82 * u[t - 1, k] + 0.18 * u[t, k]
+    return u
+
+def make_dataset(plant, n_sequences, T, mode="random"):
+    U, Y, X, N, E = [], [], [], [], []
+
+    for _ in range(n_sequences):
+        if mode == "step":
+            u = generate_step_sequence(T, in_dim=plant.cfg.in_dim)
+        else:
+            u = generate_random_sequence(T, in_dim=plant.cfg.in_dim, smooth=True)
+
+        n_seq, x_seq, eta, y_seq = plant.simulate(u)
+
+        U.append(u)
+        Y.append(y_seq)
+        X.append(x_seq)
+        N.append(n_seq)
+        E.append(eta)
+
+    U = np.stack(U, axis=0)
+    Y = np.stack(Y, axis=0)
+    X = np.stack(X, axis=0)
+    N = np.stack(N, axis=0)
+    E = np.stack(E, axis=0)
+
+    return U, Y, X, N, E
+
+# ============================================================
+# 4. Normalization
+# ============================================================
+
+class StandardScalerSeq:
+    def __init__(self):
+        self.mean = None
+        self.std = None
+
+    def fit(self, arr):
+        self.mean = arr.mean(axis=(0, 1), keepdims=True)
+        self.std = arr.std(axis=(0, 1), keepdims=True) + 1e-6
+        return self
+
+    def transform(self, arr):
+        return (arr - self.mean) / self.std
+
+    def inverse_transform(self, arr):
+        return arr * self.std + self.mean
+
+# ============================================================
+# 5. Dataset wrapper
+# ============================================================
+
+class StrongOutcomesDataset(Dataset):
+    def __init__(self, U, X, Y):
+        self.U = torch.tensor(U, dtype=DTYPE)
+        self.X = torch.tensor(X, dtype=DTYPE)
+        self.Y = torch.tensor(Y, dtype=DTYPE)
+
+    def __len__(self):
+        return self.U.shape[0]
+
+    def __getitem__(self, idx):
+        return self.U[idx], self.X[idx], self.Y[idx]
+
+# ============================================================
+# 6. Stage-1 robust initialization
+# ============================================================
+
+def build_arx_regressors(U, Y, na=2, nb=2):
+    N, T, p = U.shape
+    _, _, s = Y.shape
+    maxlag = max(na, nb)
+
+    Xreg = []
+    Yreg = []
+
+    for n in range(N):
+        u = U[n]
+        y = Y[n]
+        for t in range(maxlag, T):
+            feat = []
+            for i in range(na):
+                feat.extend((-y[t - i - 1]).tolist())
+            for j in range(nb):
+                feat.extend((u[t - j - 1]).tolist())
+            Xreg.append(feat)
+            Yreg.append(y[t].tolist())
+
+    Xreg = np.asarray(Xreg, dtype=np.float64)
+    Yreg = np.asarray(Yreg, dtype=np.float64)
+    return Xreg, Yreg
+
+def robust_stage1_arx_fit(U_step, Y_step, na=2, nb=2, max_iter=400, shrink=0.5):
+    Xreg, Yreg = build_arx_regressors(U_step, Y_step, na=na, nb=nb)
+    s = Yreg.shape[1]
+    p = U_step.shape[2]
+
+    coefs = []
+    preds = np.zeros_like(Yreg)
+
+    for k in range(s):
+        model = HuberRegressor(
+            epsilon=1.35,
+            alpha=1e-4,
+            fit_intercept=False,
+            max_iter=max_iter
+        )
+        model.fit(Xreg, Yreg[:, k])
+        ck = model.coef_.copy()
+        coefs.append(ck)
+        preds[:, k] = Xreg @ ck
+
+    coefs = np.stack(coefs, axis=0)
+
+    A_init = np.zeros((na, s, s), dtype=np.float64)
+    B_init = np.zeros((nb, s, p), dtype=np.float64)
+
+    idx = 0
+    for i in range(na):
+        A_init[i] = coefs[:, idx:idx + s]
+        idx += s
+    for j in range(nb):
+        B_init[j] = coefs[:, idx:idx + p]
+        idx += p
+
+    resid = Yreg - preds
+    R_prev = resid[:-1]
+    R_curr = resid[1:]
+    Phi_T, _, _, _ = np.linalg.lstsq(R_prev, R_curr, rcond=None)
+    Phi_init = Phi_T.T[None, :, :]
+
+    A_init *= shrink
+    B_init *= shrink
+    Phi_init *= shrink
+    return A_init, B_init, Phi_init
+
+# ============================================================
+# 7. Model components
+# ============================================================
+
+class GRUNonlinearBlock(nn.Module):
+    def __init__(self, in_dim, latent_dim,
+                 hidden_size=64, num_layers=2,
+                 dropout=0.1):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=in_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=(dropout if num_layers > 1 else 0.0),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, latent_dim),
+        )
+        self.skip = nn.Linear(in_dim, latent_dim)
+
+    def forward(self, u):
+        h_gru, _ = self.gru(u)
+        n = self.fc(h_gru) + self.skip(u)
+        return n
+
+class LinearDynamicBlock(nn.Module):
+    def __init__(self, out_dim, latent_dim, na=2, nb=2, A_init=None, B_init=None):
+        super().__init__()
+        self.out_dim = out_dim
+        self.latent_dim = latent_dim
+        self.na = na
+        self.nb = nb
+
+        if A_init is None:
+            A_init = np.zeros((na, out_dim, out_dim), dtype=np.float32)
+        if B_init is None:
+            B_init = np.zeros((nb, out_dim, latent_dim), dtype=np.float32)
+
+        self.A = nn.Parameter(torch.tensor(A_init, dtype=DTYPE))
+        self.B = nn.Parameter(torch.tensor(B_init, dtype=DTYPE))
+
+    def forward(self, n):
+        Bsz, T, _ = n.shape
+        s = self.out_dim
+        x_hist = []
+
+        for t in range(T):
+            cur = torch.zeros(Bsz, s, device=n.device, dtype=n.dtype)
+            for i in range(self.na):
+                if t - i - 1 >= 0:
+                    cur = cur - x_hist[t - i - 1] @ self.A[i].T
+            for j in range(self.nb):
+                if t - j - 1 >= 0:
+                    cur = cur + n[:, t - j - 1, :] @ self.B[j].T
+            x_hist.append(cur)
+
+        x = torch.stack(x_hist, dim=1)
+        return x
+
+    def one_step_teacher_forced(self, n, x_teacher):
+        Bsz, T, _ = n.shape
+        s = self.out_dim
+        x_tf = []
+
+        for t in range(T):
+            cur = torch.zeros(Bsz, s, device=n.device, dtype=n.dtype)
+            for i in range(self.na):
+                if t - i - 1 >= 0:
+                    cur = cur - x_teacher[:, t - i - 1, :] @ self.A[i].T
+            for j in range(self.nb):
+                if t - j - 1 >= 0:
+                    cur = cur + n[:, t - j - 1, :] @ self.B[j].T
+            x_tf.append(cur)
+
+        x_tf = torch.stack(x_tf, dim=1)
+        return x_tf
+
+class CorrelatedNoiseHead(nn.Module):
+    def __init__(self, out_dim, ar_order=1, Phi_init=None, nu=5.0):
+        super().__init__()
+        self.out_dim = out_dim
+        self.ar_order = ar_order
+        self.nu = nu
+
+        if Phi_init is None:
+            Phi_init = np.zeros((ar_order, out_dim, out_dim), dtype=np.float32)
+
+        self.Phi = nn.Parameter(torch.tensor(Phi_init, dtype=DTYPE))
+        self.log_scale = nn.Parameter(torch.zeros(out_dim, dtype=DTYPE))
+
+    def innovations(self, residual):
+        Bsz, T, s = residual.shape
+        innov = []
+
+        for t in range(T):
+            cur = residual[:, t, :]
+            for l in range(self.ar_order):
+                if t - l - 1 >= 0:
+                    cur = cur - residual[:, t - l - 1, :] @ self.Phi[l].T
+            innov.append(cur)
+
+        innov = torch.stack(innov, dim=1)
+        return innov
+
+    def robust_nll(self, innovation):
+        log_scale = torch.clamp(self.log_scale, min=-3.0, max=1.5)
+        scale = F.softplus(log_scale) + 1e-4
+        z = innovation / scale.view(1, 1, -1)
+        loss = 0.5 * (self.nu + 1.0) * torch.log1p((z ** 2) / self.nu) \
+               + torch.log(scale.view(1, 1, -1))
+        return loss.mean()
+
+class StrongHammersteinModel(nn.Module):
+    def __init__(self, in_dim, latent_dim, out_dim,
+                 hidden_size=64, num_layers=2, dropout=0.0,
+                 na=2, nb=2, noise_ar_order=1,
+                 A_init=None, B_init=None, Phi_init=None,
+                 channel_weights=None):
+        super().__init__()
+
+        self.out_dim = out_dim
+        self.na = na
+        self.nb = nb
+
+        self.nonlinear = GRUNonlinearBlock(
+            in_dim=in_dim,
+            latent_dim=latent_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        self.linear = LinearDynamicBlock(
+            out_dim=out_dim,
+            latent_dim=latent_dim,
+            na=na,
+            nb=nb,
+            A_init=A_init,
+            B_init=B_init
+        )
+        self.noise = CorrelatedNoiseHead(
+            out_dim=out_dim,
+            ar_order=noise_ar_order,
+            Phi_init=Phi_init,
+            nu=5.0
+        )
+
+        if A_init is None:
+            A_init = np.zeros((na, out_dim, out_dim), dtype=np.float32)
+        if B_init is None:
+            B_init = np.zeros((nb, out_dim, latent_dim), dtype=np.float32)
+        if Phi_init is None:
+            Phi_init = np.zeros((noise_ar_order, out_dim, out_dim), dtype=np.float32)
+
+        self.register_buffer("A_anchor", torch.tensor(A_init, dtype=DTYPE))
+        self.register_buffer("B_anchor", torch.tensor(B_init, dtype=DTYPE))
+        self.register_buffer("Phi_anchor", torch.tensor(Phi_init, dtype=DTYPE))
+
+        if channel_weights is None:
+            channel_weights = np.ones((out_dim,), dtype=np.float32)
+        self.register_buffer("channel_weights", torch.tensor(channel_weights, dtype=DTYPE))
+
+    def forward(self, u):
+        n = self.nonlinear(u)
+        x = self.linear(n)
+        return x, n
+
+    @staticmethod
+    def _peak_mask(dtrue, percentile=90):
+        mag = torch.abs(dtrue)
+        threshold = torch.quantile(mag.reshape(-1), percentile / 100.0)
+        mask = (mag > threshold).float()
+        return mask
+
+    def _weighted_huber_channelwise(self, pred, true):
+        per_elem = F.smooth_l1_loss(pred, true, reduction="none")
+        per_channel = per_elem.mean(dim=(0, 1))
+        w = self.channel_weights / (self.channel_weights.sum() + 1e-8)
+        return torch.sum(w * per_channel)
+
+    def _weighted_mse_channelwise(self, pred, true):
+        per_elem = (pred - true) ** 2
+        per_channel = per_elem.mean(dim=(0, 1))
+        w = self.channel_weights / (self.channel_weights.sum() + 1e-8)
+        return torch.sum(w * per_channel)
+
+    def _weighted_peak_loss(self, dpred, dtrue, mask):
+        w = self.channel_weights.view(1, 1, -1)
+        err = torch.abs(dpred - dtrue)
+        weighted_mask = mask * w
+        return torch.sum(weighted_mask * err) / (torch.sum(weighted_mask) + 1e-6)
+
+    def losses(self, u, x_true, y_meas,
+               lambda_noise=0.005,
+               lambda_reg=1e-4,
+               lambda_diff=0.10,
+               lambda_peak=0.10,
+               lambda_one_step=0.10,
+               lambda_anchor_A=0.005,
+               lambda_anchor_B=0.005,
+               lambda_anchor_Phi=0.002):
+        x_hat, n = self.forward(u)
+
+        pred_loss = self._weighted_huber_channelwise(x_hat, x_true)
+
+        dx_true = x_true[:, 1:, :] - x_true[:, :-1, :]
+        dx_hat = x_hat[:, 1:, :] - x_hat[:, :-1, :]
+        diff_loss = self._weighted_mse_channelwise(dx_hat, dx_true)
+
+        mask = self._peak_mask(dx_true, percentile=90)
+        if mask.sum() > 0:
+            peak_loss = self._weighted_peak_loss(dx_hat, dx_true, mask)
+        else:
+            peak_loss = torch.tensor(0.0, device=x_true.device, dtype=x_true.dtype)
+
+        x_1step = self.linear.one_step_teacher_forced(n, x_true.detach())
+        maxlag = max(self.na, self.nb)
+        if x_true.size(1) > maxlag:
+            one_step_loss = self._weighted_huber_channelwise(
+                x_1step[:, maxlag:, :],
+                x_true[:, maxlag:, :]
+            )
+        else:
+            one_step_loss = torch.tensor(0.0, device=x_true.device, dtype=x_true.dtype)
+
+        residual_meas = y_meas - x_hat
+        innovation = self.noise.innovations(residual_meas)
+        noise_loss = self.noise.robust_nll(innovation)
+
+        reg = (
+            torch.mean(self.linear.A ** 2) +
+            torch.mean(self.linear.B ** 2) +
+            torch.mean(self.noise.Phi ** 2)
+        )
+
+        anchor_A = torch.mean((self.linear.A - self.A_anchor) ** 2)
+        anchor_B = torch.mean((self.linear.B - self.B_anchor) ** 2)
+        anchor_Phi = torch.mean((self.noise.Phi - self.Phi_anchor) ** 2)
+
+        total = (
+            pred_loss
+            + lambda_diff * diff_loss
+            + lambda_peak * peak_loss
+            + lambda_one_step * one_step_loss
+            + lambda_noise * noise_loss
+            + lambda_anchor_A * anchor_A
+            + lambda_anchor_B * anchor_B
+            + lambda_anchor_Phi * anchor_Phi
+            + lambda_reg * reg
+        )
+
+        logs = {
+            "total": float(total.item()),
+            "pred_loss": float(pred_loss.item()),
+            "diff_loss": float(diff_loss.item()),
+            "peak_loss": float(peak_loss.item()),
+            "one_step_loss": float(one_step_loss.item()),
+            "noise_loss": float(noise_loss.item()),
+            "anchor_A": float(anchor_A.item()),
+            "anchor_B": float(anchor_B.item()),
+            "anchor_Phi": float(anchor_Phi.item()),
+            "reg": float(reg.item()),
+        }
+        return total, logs, x_hat
+
+# ============================================================
+# 7B. Baseline models and helpers
+# ============================================================
+class DirectGRUBaseline(nn.Module):
+    """
+    Direct sequence-to-sequence GRU baseline:
+    U -> X directly, without explicit Hammerstein decomposition,
+    without structured linear dynamic block, and without noise head.
+    """
+    def __init__(self, in_dim, out_dim,
+                 hidden_size=64, num_layers=2,
+                 dropout=0.0, channel_weights=None):
+        super().__init__()
+        self.out_dim = out_dim
+        self.gru = nn.GRU(
+            input_size=in_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=(dropout if num_layers > 1 else 0.0),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, out_dim),
+        )
+        self.skip = nn.Linear(in_dim, out_dim)
+        if channel_weights is None:
+            channel_weights = np.ones((out_dim,), dtype=np.float32)
+        self.register_buffer("channel_weights", torch.tensor(channel_weights, dtype=DTYPE))
+
+    @staticmethod
+    def _peak_mask(dtrue, percentile=90):
+        mag = torch.abs(dtrue)
+        threshold = torch.quantile(mag.reshape(-1), percentile / 100.0)
+        return (mag > threshold).float()
+
+    def _weighted_huber_channelwise(self, pred, true):
+        per_elem = F.smooth_l1_loss(pred, true, reduction="none")
+        per_channel = per_elem.mean(dim=(0, 1))
+        w = self.channel_weights / (self.channel_weights.sum() + 1e-8)
+        return torch.sum(w * per_channel)
+
+    def _weighted_mse_channelwise(self, pred, true):
+        per_elem = (pred - true) ** 2
+        per_channel = per_elem.mean(dim=(0, 1))
+        w = self.channel_weights / (self.channel_weights.sum() + 1e-8)
+        return torch.sum(w * per_channel)
+
+    def _weighted_peak_loss(self, dpred, dtrue, mask):
+        w = self.channel_weights.view(1, 1, -1)
+        err = torch.abs(dpred - dtrue)
+        weighted_mask = mask * w
+        return torch.sum(weighted_mask * err) / (torch.sum(weighted_mask) + 1e-6)
+
+    def forward(self, u):
+        h_gru, _ = self.gru(u)
+        x_hat = self.fc(h_gru) + self.skip(u)
+        return x_hat
+
+    def losses(self, u, x_true,
+               lambda_reg=1e-4,
+               lambda_diff=0.10,
+               lambda_peak=0.10):
+        x_hat = self.forward(u)
+        pred_loss = self._weighted_huber_channelwise(x_hat, x_true)
+        dx_true = x_true[:, 1:, :] - x_true[:, :-1, :]
+        dx_hat = x_hat[:, 1:, :] - x_hat[:, :-1, :]
+        diff_loss = self._weighted_mse_channelwise(dx_hat, dx_true)
+        mask = self._peak_mask(dx_true, percentile=90)
+        if mask.sum() > 0:
+            peak_loss = self._weighted_peak_loss(dx_hat, dx_true, mask)
+        else:
+            peak_loss = torch.tensor(0.0, device=x_true.device, dtype=x_true.dtype)
+        reg = sum(torch.mean(p ** 2) for p in self.parameters())
+        total = pred_loss + lambda_diff * diff_loss + lambda_peak * peak_loss + lambda_reg * reg
+        logs = {
+            "total": float(total.item()),
+            "pred_loss": float(pred_loss.item()),
+            "diff_loss": float(diff_loss.item()),
+            "peak_loss": float(peak_loss.item()),
+            "one_step_loss": 0.0,
+            "noise_loss": 0.0,
+            "anchor_A": 0.0,
+            "anchor_B": 0.0,
+            "anchor_Phi": 0.0,
+            "reg": float(reg.item()),
+        }
+        return total, logs, x_hat
+
+
+def run_epoch_direct_gru(model, loader, optimizer=None, grad_clip=1.0,
+                         lambda_reg=1e-4,
+                         lambda_diff=0.10,
+                         lambda_peak=0.10):
+    is_train = optimizer is not None
+    model.train(is_train)
+    total_loss = 0.0
+    pred_loss_acc = 0.0
+    diff_loss_acc = 0.0
+    peak_loss_acc = 0.0
+    reg_acc = 0.0
+    n_batches = 0
+    for u, x_true, y_meas in loader:
+        u = u.to(DEVICE)
+        x_true = x_true.to(DEVICE)
+        if is_train:
+            optimizer.zero_grad()
+        loss, logs, _ = model.losses(
+            u, x_true,
+            lambda_reg=lambda_reg,
+            lambda_diff=lambda_diff,
+            lambda_peak=lambda_peak,
+        )
+        if is_train:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+        total_loss += logs["total"]
+        pred_loss_acc += logs["pred_loss"]
+        diff_loss_acc += logs["diff_loss"]
+        peak_loss_acc += logs["peak_loss"]
+        reg_acc += logs["reg"]
+        n_batches += 1
+    return {
+        "total": total_loss / max(n_batches, 1),
+        "pred_loss": pred_loss_acc / max(n_batches, 1),
+        "diff_loss": diff_loss_acc / max(n_batches, 1),
+        "peak_loss": peak_loss_acc / max(n_batches, 1),
+        "reg": reg_acc / max(n_batches, 1),
+    }
+
+
+def train_direct_gru_baseline(model, train_loader, val_loader,
+                              epochs=60, lr=1e-3,
+                              lambda_reg=1e-4,
+                              lambda_diff=0.10,
+                              lambda_peak=0.10,
+                              grad_clip=1.0,
+                              early_stop_patience=12,
+                              verbose=False):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = make_cosine_scheduler(optimizer, T_max=epochs, eta_min=lr / 100)
+    best_state = None
+    best_val = np.inf
+    best_epoch = 0
+    history = []
+    patience_counter = 0
+    for ep in range(1, epochs + 1):
+        train_logs = run_epoch_direct_gru(model, train_loader, optimizer=optimizer,
+                                          grad_clip=grad_clip,
+                                          lambda_reg=lambda_reg,
+                                          lambda_diff=lambda_diff,
+                                          lambda_peak=lambda_peak)
+        with torch.no_grad():
+            val_logs = run_epoch_direct_gru(model, val_loader, optimizer=None,
+                                            grad_clip=grad_clip,
+                                            lambda_reg=lambda_reg,
+                                            lambda_diff=lambda_diff,
+                                            lambda_peak=lambda_peak)
+        scheduler.step()
+        history.append((train_logs, val_logs))
+        if val_logs["total"] < best_val:
+            best_val = val_logs["total"]
+            best_state = copy.deepcopy(model.state_dict())
+            best_epoch = ep
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if verbose and (ep == 1 or ep % 10 == 0 or ep == epochs):
+            print(f"[DirectGRU] Epoch {ep:03d} | Train={train_logs['total']:.5f} | Val={val_logs['total']:.5f}")
+        if patience_counter >= early_stop_patience:
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, history, best_epoch, best_val
+
+
+def predict_direct_gru(model, loader):
+    model.eval()
+    all_xtrue, all_ymeas, all_xhat = [], [], []
+    with torch.no_grad():
+        for u, x_true, y_meas in loader:
+            u = u.to(DEVICE)
+            x_hat = model(u)
+            all_xtrue.append(x_true.numpy())
+            all_ymeas.append(y_meas.numpy())
+            all_xhat.append(x_hat.cpu().numpy())
+    Xtrue = np.concatenate(all_xtrue, axis=0)
+    Ymeas = np.concatenate(all_ymeas, axis=0)
+    Xhat = np.concatenate(all_xhat, axis=0)
+    return Xtrue, Ymeas, Xhat
+
+
+def fit_random_arx_baseline(U_train, X_train, na=2, nb=2, max_iter=400):
+    Xreg, Yreg = build_arx_regressors(U_train, X_train, na=na, nb=nb)
+    s = Yreg.shape[1]
+    p = U_train.shape[2]
+    coefs = []
+    for k in range(s):
+        model = HuberRegressor(epsilon=1.35, alpha=1e-4, fit_intercept=False, max_iter=max_iter)
+        model.fit(Xreg, Yreg[:, k])
+        coefs.append(model.coef_.copy())
+    coefs = np.stack(coefs, axis=0)
+    A_hat = np.zeros((na, s, s), dtype=np.float64)
+    B_hat = np.zeros((nb, s, p), dtype=np.float64)
+    idx = 0
+    for i in range(na):
+        A_hat[i] = coefs[:, idx:idx + s]
+        idx += s
+    for j in range(nb):
+        B_hat[j] = coefs[:, idx:idx + p]
+        idx += p
+    return A_hat, B_hat
+
+
+def simulate_arx_baseline(U, A_hat, B_hat, na=2, nb=2):
+    N, T, p = U.shape
+    s = A_hat.shape[1]
+    Xhat = np.zeros((N, T, s), dtype=np.float64)
+    for n in range(N):
+        for t in range(T):
+            cur = np.zeros((s,), dtype=np.float64)
+            for i in range(na):
+                if t - i - 1 >= 0:
+                    cur -= A_hat[i] @ Xhat[n, t - i - 1]
+            for j in range(nb):
+                if t - j - 1 >= 0:
+                    cur += B_hat[j] @ U[n, t - j - 1]
+            Xhat[n, t] = cur
+    return Xhat
+
+# ============================================================
+# 8. Scheduler
+# ============================================================
+
+def make_cosine_scheduler(optimizer, T_max=50, eta_min=1e-6):
+    return torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=T_max, eta_min=eta_min
+    )
+
+# ============================================================
+# 9. Training / validation
+# ============================================================
+
+def set_requires_grad(module, flag=True):
+    for p in module.parameters():
+        p.requires_grad = flag
+
+def run_epoch(model, loader, optimizer=None, grad_clip=1.0,
+              lambda_noise=0.005, lambda_reg=1e-4,
+              lambda_diff=0.10, lambda_peak=0.10,
+              lambda_one_step=0.10,
+              lambda_anchor_A=0.005, lambda_anchor_B=0.005, lambda_anchor_Phi=0.002,
+              train_nonlinear=True, train_linear=True, train_noise=True):
+    is_train = optimizer is not None
+    model.train(is_train)
+
+    set_requires_grad(model.nonlinear, train_nonlinear)
+    set_requires_grad(model.linear, train_linear)
+    set_requires_grad(model.noise, train_noise)
+
+    total_loss = 0.0
+    pred_loss_acc = 0.0
+    diff_loss_acc = 0.0
+    peak_loss_acc = 0.0
+    one_step_acc = 0.0
+    noise_loss_acc = 0.0
+    anchor_A_acc = 0.0
+    anchor_B_acc = 0.0
+    anchor_Phi_acc = 0.0
+    reg_acc = 0.0
+    n_batches = 0
+
+    for u, x_true, y_meas in loader:
+        u = u.to(DEVICE)
+        x_true = x_true.to(DEVICE)
+        y_meas = y_meas.to(DEVICE)
+
+        if is_train:
+            optimizer.zero_grad()
+
+        loss, logs, _ = model.losses(
+            u, x_true, y_meas,
+            lambda_noise=lambda_noise,
+            lambda_reg=lambda_reg,
+            lambda_diff=lambda_diff,
+            lambda_peak=lambda_peak,
+            lambda_one_step=lambda_one_step,
+            lambda_anchor_A=lambda_anchor_A,
+            lambda_anchor_B=lambda_anchor_B,
+            lambda_anchor_Phi=lambda_anchor_Phi
+        )
+
+        if is_train:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+        total_loss += logs["total"]
+        pred_loss_acc += logs["pred_loss"]
+        diff_loss_acc += logs["diff_loss"]
+        peak_loss_acc += logs["peak_loss"]
+        one_step_acc += logs["one_step_loss"]
+        noise_loss_acc += logs["noise_loss"]
+        anchor_A_acc += logs["anchor_A"]
+        anchor_B_acc += logs["anchor_B"]
+        anchor_Phi_acc += logs["anchor_Phi"]
+        reg_acc += logs["reg"]
+        n_batches += 1
+
+    return {
+        "total": total_loss / max(n_batches, 1),
+        "pred_loss": pred_loss_acc / max(n_batches, 1),
+        "diff_loss": diff_loss_acc / max(n_batches, 1),
+        "peak_loss": peak_loss_acc / max(n_batches, 1),
+        "one_step_loss": one_step_acc / max(n_batches, 1),
+        "noise_loss": noise_loss_acc / max(n_batches, 1),
+        "anchor_A": anchor_A_acc / max(n_batches, 1),
+        "anchor_B": anchor_B_acc / max(n_batches, 1),
+        "anchor_Phi": anchor_Phi_acc / max(n_batches, 1),
+        "reg": reg_acc / max(n_batches, 1),
+    }
+
+def train_model(model, train_loader, val_loader,
+                epochs=100, lr=1e-3,
+                lambda_noise=0.005, lambda_reg=1e-4,
+                lambda_diff=0.10, lambda_peak=0.10,
+                lambda_one_step=0.10,
+                lambda_anchor_A=0.005, lambda_anchor_B=0.005, lambda_anchor_Phi=0.002,
+                grad_clip=1.0, verbose=True,
+                early_stop_patience=20, use_cosine=True,
+                train_nonlinear=True, train_linear=True, train_noise=True):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = make_cosine_scheduler(optimizer, T_max=epochs, eta_min=lr / 100) if use_cosine else None
+
+    best_state = None
+    best_val = np.inf
+    best_epoch = 0
+    history = []
+    patience_counter = 0
+
+    for ep in range(1, epochs + 1):
+        train_logs = run_epoch(
+            model, train_loader, optimizer=optimizer,
+            grad_clip=grad_clip,
+            lambda_noise=lambda_noise,
+            lambda_reg=lambda_reg,
+            lambda_diff=lambda_diff,
+            lambda_peak=lambda_peak,
+            lambda_one_step=lambda_one_step,
+            lambda_anchor_A=lambda_anchor_A,
+            lambda_anchor_B=lambda_anchor_B,
+            lambda_anchor_Phi=lambda_anchor_Phi,
+            train_nonlinear=train_nonlinear,
+            train_linear=train_linear,
+            train_noise=train_noise
+        )
+
+        with torch.no_grad():
+            val_logs = run_epoch(
+                model, val_loader, optimizer=None,
+                grad_clip=grad_clip,
+                lambda_noise=lambda_noise,
+                lambda_reg=lambda_reg,
+                lambda_diff=lambda_diff,
+                lambda_peak=lambda_peak,
+                lambda_one_step=lambda_one_step,
+                lambda_anchor_A=lambda_anchor_A,
+                lambda_anchor_B=lambda_anchor_B,
+                lambda_anchor_Phi=lambda_anchor_Phi,
+                train_nonlinear=True,
+                train_linear=True,
+                train_noise=True
+            )
+
+        if scheduler is not None:
+            scheduler.step()
+
+        history.append((train_logs, val_logs))
+
+        if val_logs["total"] < best_val:
+            best_val = val_logs["total"]
+            best_state = copy.deepcopy(model.state_dict())
+            best_epoch = ep
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if verbose and (ep == 1 or ep % 10 == 0 or ep == epochs):
+            lr_now = optimizer.param_groups[0]["lr"]
+            print(
+                f"Epoch {ep:03d} | LR={lr_now:.2e} | "
+                f"Train total={train_logs['total']:.5f}, pred={train_logs['pred_loss']:.5f}, "
+                f"diff={train_logs['diff_loss']:.5f}, peak={train_logs['peak_loss']:.5f}, "
+                f"one_step={train_logs['one_step_loss']:.5f}, noise={train_logs['noise_loss']:.5f} | "
+                f"Val total={val_logs['total']:.5f}, pred={val_logs['pred_loss']:.5f}, "
+                f"diff={val_logs['diff_loss']:.5f}, peak={val_logs['peak_loss']:.5f}, "
+                f"one_step={val_logs['one_step_loss']:.5f}, noise={val_logs['noise_loss']:.5f}"
+            )
+
+        if patience_counter >= early_stop_patience:
+            if verbose:
+                print(f"Early stopping at epoch {ep}, best epoch was {best_epoch} with val total={best_val:.5f}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model, history, best_epoch, best_val
+
+# ============================================================
+# 10. Hyperparameter search
+# ============================================================
+
+def automatic_hyperparameter_search(
+    in_dim, latent_dim, out_dim,
+    na, nb, noise_ar_order,
+    A_init, B_init, Phi_init,
+    train_loader, val_loader,
+    channel_weights,
+    max_trials=None,
+    search_epochs=20,
+    rng_seed=2026
+):
+    rng = random.Random(rng_seed)
+
+    hidden_candidates = [32, 48, 64]
+    layer_candidates = [1, 2]
+    dropout_candidates = [0.0, 0.1]
+    lr_candidates = [5e-4, 7e-4, 1e-3]
+    lambda_diff_candidates = [0.10, 0.20]
+    lambda_peak_candidates = [0.10, 0.20]
+    lambda_one_step_candidates = [0.05, 0.10, 0.20]
+
+    all_configs = list(product(
+        hidden_candidates,
+        layer_candidates,
+        dropout_candidates,
+        lr_candidates,
+        lambda_diff_candidates,
+        lambda_peak_candidates,
+        lambda_one_step_candidates
+    ))
+    rng.shuffle(all_configs)
+
+    if max_trials is None:
+        max_trials = 24 if DEVICE == "cuda" else 12
+
+    trial_configs = all_configs[:max_trials]
+
+    best_cfg = None
+    best_score = np.inf
+    all_results = []
+
+    print("\n[Automatic Hyperparameter Search - Final Benchmark]")
+    print(f"Search budget: {max_trials} trials on device={DEVICE}")
+
+    for trial_id, cfg_trial in enumerate(trial_configs, start=1):
+        hidden_size, num_layers, dropout, lr, lambda_diff, lambda_peak, lambda_one_step = cfg_trial
+
+        print(
+            f"  Trial {trial_id:02d}/{max_trials} -> "
+            f"hidden={hidden_size}, layers={num_layers}, dropout={dropout}, lr={lr}, "
+            f"lambda_diff={lambda_diff}, lambda_peak={lambda_peak}, lambda_one_step={lambda_one_step}"
+        )
+
+        model = StrongHammersteinModel(
+            in_dim=in_dim,
+            latent_dim=latent_dim,
+            out_dim=out_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            na=na,
+            nb=nb,
+            noise_ar_order=noise_ar_order,
+            A_init=A_init,
+            B_init=B_init,
+            Phi_init=Phi_init,
+            channel_weights=channel_weights
+        ).to(DEVICE)
+
+        model, _, _, _ = train_model(
+            model, train_loader, val_loader,
+            epochs=search_epochs,
+            lr=lr,
+            lambda_noise=0.0,
+            lambda_reg=1e-4,
+            lambda_diff=lambda_diff,
+            lambda_peak=lambda_peak,
+            lambda_one_step=lambda_one_step,
+            lambda_anchor_A=0.01,
+            lambda_anchor_B=0.01,
+            lambda_anchor_Phi=0.002,
+            grad_clip=1.0,
+            verbose=False,
+            early_stop_patience=6,
+            use_cosine=False,
+            train_nonlinear=True,
+            train_linear=True,
+            train_noise=False
+        )
+
+        with torch.no_grad():
+            val_logs = run_epoch(
+                model, val_loader, optimizer=None,
+                lambda_noise=0.0,
+                lambda_reg=1e-4,
+                lambda_diff=lambda_diff,
+                lambda_peak=lambda_peak,
+                lambda_one_step=lambda_one_step,
+                lambda_anchor_A=0.01,
+                lambda_anchor_B=0.01,
+                lambda_anchor_Phi=0.002,
+                train_nonlinear=True,
+                train_linear=True,
+                train_noise=False
+            )
+
+        score = (
+            val_logs["pred_loss"]
+            + 0.15 * val_logs["diff_loss"]
+            + 0.10 * val_logs["peak_loss"]
+            + 0.20 * val_logs["one_step_loss"]
+        )
+
+        result = {
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "lr": lr,
+            "lambda_diff": lambda_diff,
+            "lambda_peak": lambda_peak,
+            "lambda_one_step": lambda_one_step,
+            "val_total_loss": val_logs["total"],
+            "val_pred_loss": val_logs["pred_loss"],
+            "val_diff_loss": val_logs["diff_loss"],
+            "val_peak_loss": val_logs["peak_loss"],
+            "val_one_step_loss": val_logs["one_step_loss"],
+            "score": score,
+        }
+        all_results.append(result)
+
+        print(
+            f"     val_total={val_logs['total']:.6f}, "
+            f"pred={val_logs['pred_loss']:.6f}, "
+            f"diff={val_logs['diff_loss']:.6f}, "
+            f"peak={val_logs['peak_loss']:.6f}, "
+            f"one_step={val_logs['one_step_loss']:.6f}, "
+            f"score={score:.6f}"
+        )
+
+        if score < best_score:
+            best_score = score
+            best_cfg = result
+
+    print("\n[Best Hyperparameter Configuration - Final Benchmark]")
+    for k, v in best_cfg.items():
+        print(f"  {k}: {v}")
+
+    return best_cfg, all_results
+
+# ============================================================
+# 11. Stage-B noise-weight tuning
+# ============================================================
+
+def tune_noise_weight_after_stage_a(
+    stage_a_model,
+    train_loader,
+    val_loader,
+    candidate_noise_weights=(0.0, 0.002, 0.005, 0.01),
+    stage_b_epochs=12,
+    base_lr=5e-4,
+    lambda_diff=0.10,
+    lambda_peak=0.10,
+    lambda_one_step=0.10
+):
+    print("\n[Noise Weight Tuning after Stage A]")
+
+    best_lambda = None
+    best_val = np.inf
+    all_trials = []
+
+    for lam_n in candidate_noise_weights:
+        trial_model = copy.deepcopy(stage_a_model)
+
+        trial_model, _, _, _ = train_model(
+            trial_model,
+            train_loader,
+            val_loader,
+            epochs=stage_b_epochs,
+            lr=base_lr,
+            lambda_noise=lam_n,
+            lambda_reg=1e-4,
+            lambda_diff=lambda_diff,
+            lambda_peak=lambda_peak,
+            lambda_one_step=lambda_one_step,
+            lambda_anchor_A=0.005,
+            lambda_anchor_B=0.005,
+            lambda_anchor_Phi=0.005,
+            grad_clip=1.0,
+            verbose=False,
+            early_stop_patience=4,
+            use_cosine=True,
+            train_nonlinear=False,
+            train_linear=True,
+            train_noise=True
+        )
+
+        with torch.no_grad():
+            val_logs = run_epoch(
+                trial_model, val_loader, optimizer=None,
+                lambda_noise=lam_n,
+                lambda_reg=1e-4,
+                lambda_diff=lambda_diff,
+                lambda_peak=lambda_peak,
+                lambda_one_step=lambda_one_step,
+                lambda_anchor_A=0.005,
+                lambda_anchor_B=0.005,
+                lambda_anchor_Phi=0.005,
+                train_nonlinear=True,
+                train_linear=True,
+                train_noise=True
+            )
+
+        score = (
+            val_logs["pred_loss"]
+            + 0.15 * val_logs["diff_loss"]
+            + 0.10 * val_logs["peak_loss"]
+            + 0.20 * val_logs["one_step_loss"]
+        )
+
+        row = {
+            "lambda_noise": lam_n,
+            "val_total": val_logs["total"],
+            "val_pred": val_logs["pred_loss"],
+            "val_diff": val_logs["diff_loss"],
+            "val_peak": val_logs["peak_loss"],
+            "val_one_step": val_logs["one_step_loss"],
+            "val_noise": val_logs["noise_loss"],
+            "score": score,
+        }
+        all_trials.append(row)
+
+        print(
+            f"  lambda_noise={lam_n:.4f} -> "
+            f"val_total={val_logs['total']:.6f}, "
+            f"pred={val_logs['pred_loss']:.6f}, "
+            f"diff={val_logs['diff_loss']:.6f}, "
+            f"peak={val_logs['peak_loss']:.6f}, "
+            f"one_step={val_logs['one_step_loss']:.6f}, "
+            f"noise={val_logs['noise_loss']:.6f}, "
+            f"score={score:.6f}"
+        )
+
+        if score < best_val:
+            best_val = score
+            best_lambda = lam_n
+
+    print(f"[Best Stage-B Noise Weight] lambda_noise = {best_lambda:.4f}")
+    return best_lambda, all_trials
+
+# ============================================================
+# 12. Prediction / evaluation
+# ============================================================
+
+def predict_model(model, loader):
+    model.eval()
+    all_xtrue = []
+    all_ymeas = []
+    all_xhat = []
+
+    with torch.no_grad():
+        for u, x_true, y_meas in loader:
+            u = u.to(DEVICE)
+            x_true = x_true.to(DEVICE)
+            y_meas = y_meas.to(DEVICE)
+            x_hat, _ = model(u)
+
+            all_xtrue.append(x_true.cpu().numpy())
+            all_ymeas.append(y_meas.cpu().numpy())
+            all_xhat.append(x_hat.cpu().numpy())
+
+    Xtrue = np.concatenate(all_xtrue, axis=0)
+    Ymeas = np.concatenate(all_ymeas, axis=0)
+    Xhat = np.concatenate(all_xhat, axis=0)
+    return Xtrue, Ymeas, Xhat
+
+def evaluate_metrics(Y_true, Y_pred):
+    mse = mse_np(Y_true, Y_pred)
+    mae = mae_np(Y_true, Y_pred)
+    rmse = rmse_np(Y_true, Y_pred)
+    r2 = r2_np(Y_true, Y_pred)
+    nrmse = nrmse_np(Y_true, Y_pred)
+    fitp = fit_percent_np(Y_true, Y_pred)
+    mape = mape_np(Y_true, Y_pred)
+    smape = smape_np(Y_true, Y_pred)
+    wmape = wmape_np(Y_true, Y_pred)
+
+    return {
+        "MSE": float(mse),
+        "MAE": float(mae),
+        "RMSE": float(rmse),
+        "NRMSE": float(nrmse),
+        "R2": float(r2),
+        "FIT": float(fitp),
+        "MAPE": float(mape),
+        "sMAPE": float(smape),
+        "wMAPE": float(wmape),
+    }
+
+def evaluate_metrics_with_channels(Y_true, Y_pred):
+    overall = evaluate_metrics(Y_true, Y_pred)
+    per_channel = {}
+    for k in range(Y_true.shape[-1]):
+        per_channel[f"channel_{k+1}"] = evaluate_metrics(Y_true[..., k], Y_pred[..., k])
+    return {"overall": overall, "per_channel": per_channel}
+
+def print_metrics_block(name, block):
+    overall = block["overall"]
+    print(f"\n[{name}]")
+    for k, v in overall.items():
+        suffix = "%" if k in ["FIT", "MAPE", "sMAPE", "wMAPE"] else ""
+        print(f"  {k:<6}= {v:.6f}{suffix}")
+    for ch_name, ch_metrics in block["per_channel"].items():
+        print(f"  {ch_name}:")
+        for k, v in ch_metrics.items():
+            suffix = "%" if k in ["FIT", "MAPE", "sMAPE", "wMAPE"] else ""
+            print(f"    {k:<6}= {v:.6f}{suffix}")
+
+# ============================================================
+# 13. Plot saving helpers
+# ============================================================
+
+def save_current_figure(path):
+    plt.tight_layout()
+    plt.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+def plot_training_history(history, title_prefix="Training History", save_dir=None):
+    train_total = [h[0]["total"] for h in history]
+    val_total = [h[1]["total"] for h in history]
+    train_pred = [h[0]["pred_loss"] for h in history]
+    val_pred = [h[1]["pred_loss"] for h in history]
+    train_diff = [h[0]["diff_loss"] for h in history]
+    val_diff = [h[1]["diff_loss"] for h in history]
+    train_peak = [h[0]["peak_loss"] for h in history]
+    val_peak = [h[1]["peak_loss"] for h in history]
+    train_one = [h[0]["one_step_loss"] for h in history]
+    val_one = [h[1]["one_step_loss"] for h in history]
+    train_noise = [h[0]["noise_loss"] for h in history]
+    val_noise = [h[1]["noise_loss"] for h in history]
+
+    epochs = np.arange(1, len(history) + 1)
+
+    plt.figure(figsize=(14, 16))
+
+    plt.subplot(6, 1, 1)
+    plt.plot(epochs, train_total, label="Train total")
+    plt.plot(epochs, val_total, label="Val total")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.title(f"{title_prefix} - Total Loss")
+
+    plt.subplot(6, 1, 2)
+    plt.plot(epochs, train_pred, label="Train prediction")
+    plt.plot(epochs, val_pred, label="Val prediction")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.title(f"{title_prefix} - Prediction Loss")
+
+    plt.subplot(6, 1, 3)
+    plt.plot(epochs, train_diff, label="Train derivative")
+    plt.plot(epochs, val_diff, label="Val derivative")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.title(f"{title_prefix} - Derivative Loss")
+
+    plt.subplot(6, 1, 4)
+    plt.plot(epochs, train_peak, label="Train peak")
+    plt.plot(epochs, val_peak, label="Val peak")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.title(f"{title_prefix} - Peak Loss")
+
+    plt.subplot(6, 1, 5)
+    plt.plot(epochs, train_one, label="Train one-step")
+    plt.plot(epochs, val_one, label="Val one-step")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.title(f"{title_prefix} - One-Step Linear Consistency Loss")
+
+    plt.subplot(6, 1, 6)
+    plt.plot(epochs, train_noise, label="Train noise")
+    plt.plot(epochs, val_noise, label="Val noise")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.title(f"{title_prefix} - Noise Loss")
+
+    if save_dir is not None:
+        save_current_figure(os.path.join(save_dir, "training_history.png"))
+    else:
+        plt.show()
+
+def plot_expected_style_figures(Y_true, Y_pred, history=None,
+                                seq_idx=0, channel=0,
+                                zoom_start=20, zoom_end=40,
+                                bins=30,
+                                prefix="expected",
+                                save_dir=None):
+    true_sig = Y_true[seq_idx, :, channel]
+    pred_sig = Y_pred[seq_idx, :, channel]
+    t = np.arange(len(true_sig))
+
+    err = pred_sig - true_sig
+    dtrue = np.diff(true_sig)
+    dpred = np.diff(pred_sig)
+    td = np.arange(len(dtrue))
+
+    # Training convergence
+    if history is not None:
+        train_total = [h[0]["total"] for h in history]
+        val_total = [h[1]["total"] for h in history]
+        epochs = np.arange(1, len(history) + 1)
+
+        plt.figure(figsize=(7, 5))
+        plt.plot(epochs, train_total, label="Train")
+        plt.plot(epochs, val_total, label="Validation")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training Convergence")
+        plt.grid(True, alpha=0.4)
+        plt.legend()
+        if save_dir is not None:
+            save_current_figure(os.path.join(save_dir, f"{prefix}_training_convergence.png"))
+        else:
+            plt.show()
+
+    # Prediction vs true
+    plt.figure(figsize=(7, 5))
+    plt.plot(t, true_sig, label="True", linewidth=1.8)
+    plt.plot(t, pred_sig, "--", label="Predicted", linewidth=1.8)
+    plt.xlabel("Time")
+    plt.ylabel("Output")
+    plt.title("Prediction vs True Output")
+    plt.grid(True, alpha=0.4)
+    plt.legend()
+    if save_dir is not None:
+        save_current_figure(os.path.join(save_dir, f"{prefix}_prediction_vs_true.png"))
+    else:
+        plt.show()
+
+    # Derivative matching
+    plt.figure(figsize=(7, 5))
+    plt.plot(td, dtrue, label="True derivative", linewidth=1.5)
+    plt.plot(td, dpred, "--", label="Predicted derivative", linewidth=1.5)
+    plt.title("Derivative Matching")
+    plt.grid(True, alpha=0.4)
+    plt.legend()
+    if save_dir is not None:
+        save_current_figure(os.path.join(save_dir, f"{prefix}_derivative_matching.png"))
+    else:
+        plt.show()
+
+    # Error histogram
+    plt.figure(figsize=(7, 5))
+    plt.hist(err, bins=bins, edgecolor="white")
+    plt.xlabel("Error")
+    plt.ylabel("Frequency")
+    plt.title("Error Distribution")
+    plt.grid(True, alpha=0.25)
+    if save_dir is not None:
+        save_current_figure(os.path.join(save_dir, f"{prefix}_error_distribution.png"))
+    else:
+        plt.show()
+
+    # Peak capture zoom
+    zs = max(0, zoom_start)
+    ze = min(len(true_sig), zoom_end)
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(t[zs:ze], true_sig[zs:ze], label="True", linewidth=1.8)
+    plt.plot(t[zs:ze], pred_sig[zs:ze], "--", label="Predicted", linewidth=1.8)
+    plt.title("Peak Capture (Zoom)")
+    plt.grid(True, alpha=0.4)
+    plt.legend()
+    if save_dir is not None:
+        save_current_figure(os.path.join(save_dir, f"{prefix}_peak_capture_zoom.png"))
+    else:
+        plt.show()
+
+# ============================================================
+# 14. Aggregation helpers
+# ============================================================
+
+def flatten_metric_block(prefix, block):
+    row = {}
+    for k, v in block["overall"].items():
+        row[f"{prefix}_{k}"] = v
+    for ch_name, ch_metrics in block["per_channel"].items():
+        for k, v in ch_metrics.items():
+            row[f"{prefix}_{ch_name}_{k}"] = v
+    return row
+
+def aggregate_seed_rows(seed_rows):
+    """
+    Compute mean/std over all numeric fields except 'seed' and paths.
+    """
+    numeric_keys = []
+    for key in seed_rows[0].keys():
+        if key in ["seed", "seed_dir"]:
+            continue
+        if isinstance(seed_rows[0][key], (int, float, np.floating)):
+            numeric_keys.append(key)
+
+    mean_row = {"stat": "mean"}
+    std_row = {"stat": "std"}
+
+    for k in numeric_keys:
+        vals = np.array([row[k] for row in seed_rows], dtype=float)
+        mean_row[k] = float(np.mean(vals))
+        std_row[k] = float(np.std(vals, ddof=0))
+
+    return [mean_row, std_row]
+
+# ============================================================
+# 15. Single-seed benchmark
+# ============================================================
+
+@dataclass
+class ExperimentConfig:
+    # CPU defaults
+    n_step_train_cpu: int = 320
+    n_step_val_cpu: int = 80
+    n_train_cpu: int = 512
+    n_val_cpu: int = 128
+    n_test_cpu: int = 128
+    search_trials_cpu: int = 12
+    search_epochs_cpu: int = 20
+    batch_size_cpu: int = 32
+
+    # GPU defaults
+    n_step_train_gpu: int = 600
+    n_step_val_gpu: int = 160
+    n_train_gpu: int = 1800
+    n_val_gpu: int = 400
+    n_test_gpu: int = 400
+    search_trials_gpu: int = 28
+    search_epochs_gpu: int = 28
+    batch_size_gpu: int = 64
+
+    T_step: int = 80
+    T_main: int = 100
+    output_root: str = "benchmark_outputs_multiseed"
+
+def run_single_seed(seed, root_dir, cfg=None, exp=None):
+    if cfg is None:
+        cfg = PlantConfig(
+            in_dim=2,
+            latent_dim=2,
+            out_dim=2,
+            hidden_dim=12,
+            na=2,
+            nb=2,
+            noise_ar_order=1,
+            student_df=5.0
+        )
+    if exp is None:
+        exp = ExperimentConfig()
+
+    set_seed(seed)
+
+    seed_dir = os.path.join(root_dir, f"seed_{seed}")
+    ensure_dir(seed_dir)
+    ensure_dir(os.path.join(seed_dir, "figures"))
+    ensure_dir(os.path.join(seed_dir, "arrays"))
+
+    plant = TrueMIMOHammersteinPlant(cfg)
+
+    use_gpu_mode = (DEVICE == "cuda")
+    if use_gpu_mode:
+        n_step_train = exp.n_step_train_gpu
+        n_step_val = exp.n_step_val_gpu
+        n_train = exp.n_train_gpu
+        n_val = exp.n_val_gpu
+        n_test = exp.n_test_gpu
+        search_trials = exp.search_trials_gpu
+        search_epochs = exp.search_epochs_gpu
+        batch_size = exp.batch_size_gpu
+    else:
+        n_step_train = exp.n_step_train_cpu
+        n_step_val = exp.n_step_val_cpu
+        n_train = exp.n_train_cpu
+        n_val = exp.n_val_cpu
+        n_test = exp.n_test_cpu
+        search_trials = exp.search_trials_cpu
+        search_epochs = exp.search_epochs_cpu
+        batch_size = exp.batch_size_cpu
+
+    save_json(
+        {
+            "seed": seed,
+            "device": DEVICE,
+            "plant_config": asdict(cfg),
+            "experiment_config": asdict(exp)
+        },
+        os.path.join(seed_dir, "run_config.json")
+    )
+
+    print(f"\n==================== SEED {seed} ====================")
+    print(f"Using device: {DEVICE}")
+
+    # Stage-1
+    print("[Data] Generating step-signal dataset for Stage-1 initialization...")
+    U_step_train, Y_step_train, X_step_train, _, _ = make_dataset(
+        plant, n_sequences=n_step_train, T=exp.T_step, mode="step"
+    )
+    U_step_val, Y_step_val, X_step_val, _, _ = make_dataset(
+        plant, n_sequences=n_step_val, T=exp.T_step, mode="step"
+    )
+
+    print("[Stage-1] Robust ARX initialization from step-signal data...")
+    A_init, B_init, Phi_init = robust_stage1_arx_fit(
+        U_step_train, Y_step_train,
+        na=cfg.na, nb=cfg.nb,
+        max_iter=400,
+        shrink=0.5
+    )
+
+    np.savez(
+        os.path.join(seed_dir, "arrays", "initial_params.npz"),
+        A_init=A_init, B_init=B_init, Phi_init=Phi_init
+    )
+
+    # Stage-2
+    print("[Data] Generating random-signal datasets for Stage-2 training...")
+    U_train, Y_train, X_train, _, _ = make_dataset(plant, n_sequences=n_train, T=exp.T_main, mode="random")
+    U_val, Y_val, X_val, _, _ = make_dataset(plant, n_sequences=n_val, T=exp.T_main, mode="random")
+    U_test, Y_test, X_test, _, _ = make_dataset(plant, n_sequences=n_test, T=exp.T_main, mode="random")
+
+    # Normalize
+    u_scaler = StandardScalerSeq().fit(U_train)
+    x_scaler = StandardScalerSeq().fit(X_train)
+
+    U_train_n = u_scaler.transform(U_train)
+    U_val_n = u_scaler.transform(U_val)
+    U_test_n = u_scaler.transform(U_test)
+
+    X_train_n = x_scaler.transform(X_train)
+    X_val_n = x_scaler.transform(X_val)
+    X_test_n = x_scaler.transform(X_test)
+
+    Y_train_n = x_scaler.transform(Y_train)
+    Y_val_n = x_scaler.transform(Y_val)
+    Y_test_n = x_scaler.transform(Y_test)
+
+    train_ds = StrongOutcomesDataset(U_train_n, X_train_n, Y_train_n)
+    val_ds = StrongOutcomesDataset(U_val_n, X_val_n, Y_val_n)
+    test_ds = StrongOutcomesDataset(U_test_n, X_test_n, Y_test_n)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    channel_weights = np.array([1.35, 1.00], dtype=np.float32)
+
+    # Search
+    best_cfg, all_search_results = automatic_hyperparameter_search(
+        in_dim=cfg.in_dim,
+        latent_dim=cfg.latent_dim,
+        out_dim=cfg.out_dim,
+        na=cfg.na,
+        nb=cfg.nb,
+        noise_ar_order=cfg.noise_ar_order,
+        A_init=A_init,
+        B_init=B_init,
+        Phi_init=Phi_init,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        channel_weights=channel_weights,
+        max_trials=search_trials,
+        search_epochs=search_epochs,
+        rng_seed=seed + 100
+    )
+    save_csv_dicts(all_search_results, os.path.join(seed_dir, "search_results.csv"))
+    save_json(best_cfg, os.path.join(seed_dir, "best_hyperparams.json"))
+
+    # Final model
+    final_model = StrongHammersteinModel(
+        in_dim=cfg.in_dim,
+        latent_dim=cfg.latent_dim,
+        out_dim=cfg.out_dim,
+        hidden_size=best_cfg["hidden_size"],
+        num_layers=best_cfg["num_layers"],
+        dropout=best_cfg["dropout"],
+        na=cfg.na,
+        nb=cfg.nb,
+        noise_ar_order=cfg.noise_ar_order,
+        A_init=A_init,
+        B_init=B_init,
+        Phi_init=Phi_init,
+        channel_weights=channel_weights
+    ).to(DEVICE)
+
+    # Stage A
+    final_model, history_A, best_epoch_A, best_val_A = train_model(
+        final_model, train_loader, val_loader,
+        epochs=120 if DEVICE == "cuda" else 80,
+        lr=best_cfg["lr"],
+        lambda_noise=0.0,
+        lambda_reg=1e-4,
+        lambda_diff=best_cfg["lambda_diff"],
+        lambda_peak=best_cfg["lambda_peak"],
+        lambda_one_step=best_cfg["lambda_one_step"],
+        lambda_anchor_A=0.01,
+        lambda_anchor_B=0.01,
+        lambda_anchor_Phi=0.002,
+        grad_clip=1.0,
+        verbose=True,
+        early_stop_patience=20,
+        use_cosine=True,
+        train_nonlinear=True,
+        train_linear=True,
+        train_noise=False
+    )
+
+    # Noise tuning
+    best_lambda_noise, noise_tuning_results = tune_noise_weight_after_stage_a(
+        stage_a_model=final_model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        candidate_noise_weights=(0.0, 0.002, 0.005, 0.01),
+        stage_b_epochs=15 if DEVICE == "cuda" else 12,
+        base_lr=best_cfg["lr"] * 0.5,
+        lambda_diff=best_cfg["lambda_diff"],
+        lambda_peak=best_cfg["lambda_peak"],
+        lambda_one_step=best_cfg["lambda_one_step"]
+    )
+    save_csv_dicts(noise_tuning_results, os.path.join(seed_dir, "noise_weight_tuning.csv"))
+    save_json({"best_lambda_noise": best_lambda_noise}, os.path.join(seed_dir, "best_noise_weight.json"))
+
+    # Stage B
+    final_model, history_B, best_epoch_B, best_val_B = train_model(
+        final_model, train_loader, val_loader,
+        epochs=80 if DEVICE == "cuda" else 60,
+        lr=best_cfg["lr"] * 0.5,
+        lambda_noise=best_lambda_noise,
+        lambda_reg=1e-4,
+        lambda_diff=best_cfg["lambda_diff"],
+        lambda_peak=best_cfg["lambda_peak"],
+        lambda_one_step=best_cfg["lambda_one_step"],
+        lambda_anchor_A=0.005,
+        lambda_anchor_B=0.005,
+        lambda_anchor_Phi=0.005,
+        grad_clip=1.0,
+        verbose=True,
+        early_stop_patience=15,
+        use_cosine=True,
+        train_nonlinear=False,
+        train_linear=True,
+        train_noise=True
+    )
+
+    # Stage C
+    final_model, history_C, best_epoch_C, best_val_C = train_model(
+        final_model, train_loader, val_loader,
+        epochs=30 if DEVICE == "cuda" else 15,
+        lr=best_cfg["lr"] * 0.25,
+        lambda_noise=best_lambda_noise,
+        lambda_reg=1e-4,
+        lambda_diff=best_cfg["lambda_diff"],
+        lambda_peak=best_cfg["lambda_peak"],
+        lambda_one_step=best_cfg["lambda_one_step"],
+        lambda_anchor_A=0.002,
+        lambda_anchor_B=0.002,
+        lambda_anchor_Phi=0.002,
+        grad_clip=1.0,
+        verbose=True,
+        early_stop_patience=8,
+        use_cosine=True,
+        train_nonlinear=True,
+        train_linear=True,
+        train_noise=True
+    )
+
+    history = history_A + history_B + history_C
+
+    # Predict
+    X_val_true_n, Y_val_meas_n, X_val_hat_n = predict_model(final_model, val_loader)
+    X_test_true_n, Y_test_meas_n, X_test_hat_n = predict_model(final_model, test_loader)
+
+    X_val_true = x_scaler.inverse_transform(X_val_true_n)
+    Y_val_meas = x_scaler.inverse_transform(Y_val_meas_n)
+    X_val_hat = x_scaler.inverse_transform(X_val_hat_n)
+
+    X_test_true = x_scaler.inverse_transform(X_test_true_n)
+    Y_test_meas = x_scaler.inverse_transform(Y_test_meas_n)
+    X_test_hat = x_scaler.inverse_transform(X_test_hat_n)
+
+    np.savez(
+        os.path.join(seed_dir, "arrays", "predictions_and_targets.npz"),
+        X_val_true=X_val_true,
+        Y_val_meas=Y_val_meas,
+        X_val_hat=X_val_hat,
+        X_test_true=X_test_true,
+        Y_test_meas=Y_test_meas,
+        X_test_hat=X_test_hat
+    )
+
+    # Metrics
+    metrics_val_X = evaluate_metrics_with_channels(X_val_true, X_val_hat)
+    metrics_test_X = evaluate_metrics_with_channels(X_test_true, X_test_hat)
+    metrics_val_Y = evaluate_metrics_with_channels(Y_val_meas, X_val_hat)
+    metrics_test_Y = evaluate_metrics_with_channels(Y_test_meas, X_test_hat)
+
+    # Parameter recovery
+    A_hat = final_model.linear.A.detach().cpu().numpy()
+    B_hat = final_model.linear.B.detach().cpu().numpy()
+    Phi_hat = final_model.noise.Phi.detach().cpu().numpy()
+
+    A_true = np.stack(plant.A, axis=0)
+    B_true = np.stack(plant.B, axis=0)
+    Phi_true = plant.Phi[None, :, :]
+
+    param_errors = {
+        "rel_error_A": float(relative_param_error(A_true, A_hat)),
+        "rel_error_B": float(relative_param_error(B_true, B_hat)),
+        "rel_error_Phi": float(relative_param_error(Phi_true, Phi_hat)),
+    }
+
+    # Save metrics/params
+    all_metrics = {
+        "validation_on_X": metrics_val_X,
+        "test_on_X": metrics_test_X,
+        "validation_vs_Y": metrics_val_Y,
+        "test_vs_Y": metrics_test_Y,
+        "parameter_errors": param_errors
+    }
+    save_json(all_metrics, os.path.join(seed_dir, "metrics.json"))
+
+    flat_rows = []
+    for split_name, block in [
+        ("validation_on_X", metrics_val_X),
+        ("test_on_X", metrics_test_X),
+        ("validation_vs_Y", metrics_val_Y),
+        ("test_vs_Y", metrics_test_Y),
+    ]:
+        row = {"split": split_name}
+        row.update(flatten_metric_block(split_name, block))
+        flat_rows.append(row)
+
+    save_csv_dicts(flat_rows, os.path.join(seed_dir, "metrics_summary.csv"))
+    save_csv_dicts([param_errors], os.path.join(seed_dir, "parameter_errors.csv"))
+
+    np.savez(
+        os.path.join(seed_dir, "arrays", "learned_params.npz"),
+        A_hat=A_hat, B_hat=B_hat, Phi_hat=Phi_hat,
+        A_true=A_true, B_true=B_true, Phi_true=Phi_true
+    )
+
+    training_summary = {
+        "best_epoch_stage_A": best_epoch_A,
+        "best_val_stage_A": best_val_A,
+        "best_epoch_stage_B": best_epoch_B,
+        "best_val_stage_B": best_val_B,
+        "best_epoch_stage_C": best_epoch_C,
+        "best_val_stage_C": best_val_C,
+        "best_lambda_noise": best_lambda_noise
+    }
+    save_json(training_summary, os.path.join(seed_dir, "training_summary.json"))
+    # ========================================================
+    # Baseline comparisons
+    # ========================================================
+    print("\n[Baselines] Training and evaluating additional comparators...")
+    baseline_results = {}
+
+    # ------------------------
+    # Baseline 1: Direct GRU
+    # ------------------------
+    direct_gru = DirectGRUBaseline(
+        in_dim=cfg.in_dim,
+        out_dim=cfg.out_dim,
+        hidden_size=best_cfg["hidden_size"],
+        num_layers=best_cfg["num_layers"],
+        dropout=best_cfg["dropout"],
+        channel_weights=channel_weights,
+    ).to(DEVICE)
+
+    direct_gru, direct_history, direct_best_epoch, direct_best_val = train_direct_gru_baseline(
+        direct_gru,
+        train_loader,
+        val_loader,
+        epochs=80 if DEVICE == "cuda" else 50,
+        lr=best_cfg["lr"],
+        lambda_reg=1e-4,
+        lambda_diff=best_cfg["lambda_diff"],
+        lambda_peak=best_cfg["lambda_peak"],
+        grad_clip=1.0,
+        early_stop_patience=10,
+        verbose=False,
+    )
+
+    X_val_true_n_b1, Y_val_meas_n_b1, X_val_hat_n_b1 = predict_direct_gru(direct_gru, val_loader)
+    X_test_true_n_b1, Y_test_meas_n_b1, X_test_hat_n_b1 = predict_direct_gru(direct_gru, test_loader)
+
+    X_val_hat_b1 = x_scaler.inverse_transform(X_val_hat_n_b1)
+    X_test_hat_b1 = x_scaler.inverse_transform(X_test_hat_n_b1)
+
+    baseline_results["direct_gru"] = {
+        "validation_on_X": evaluate_metrics_with_channels(X_val_true, X_val_hat_b1),
+        "test_on_X": evaluate_metrics_with_channels(X_test_true, X_test_hat_b1),
+        "validation_vs_Y": evaluate_metrics_with_channels(Y_val_meas, X_val_hat_b1),
+        "test_vs_Y": evaluate_metrics_with_channels(Y_test_meas, X_test_hat_b1),
+        "best_epoch": int(direct_best_epoch),
+        "best_val": float(direct_best_val),
+    }
+
+    # ------------------------
+    # Baseline 2: Linear ARX
+    # ------------------------
+    A_arx, B_arx = fit_random_arx_baseline(U_train_n, X_train_n, na=cfg.na, nb=cfg.nb, max_iter=400)
+
+    X_val_hat_arx_n = simulate_arx_baseline(U_val_n, A_arx, B_arx, na=cfg.na, nb=cfg.nb)
+    X_test_hat_arx_n = simulate_arx_baseline(U_test_n, A_arx, B_arx, na=cfg.na, nb=cfg.nb)
+
+    X_val_hat_arx = x_scaler.inverse_transform(X_val_hat_arx_n)
+    X_test_hat_arx = x_scaler.inverse_transform(X_test_hat_arx_n)
+
+    baseline_results["linear_arx"] = {
+        "validation_on_X": evaluate_metrics_with_channels(X_val_true, X_val_hat_arx),
+        "test_on_X": evaluate_metrics_with_channels(X_test_true, X_test_hat_arx),
+        "validation_vs_Y": evaluate_metrics_with_channels(Y_val_meas, X_val_hat_arx),
+        "test_vs_Y": evaluate_metrics_with_channels(Y_test_meas, X_test_hat_arx),
+    }
+
+    save_json(baseline_results, os.path.join(seed_dir, "baseline_metrics.json"))
+
+    baseline_rows = []
+    for baseline_name, result_block in baseline_results.items():
+        if not isinstance(result_block, dict):
+            continue
+        row = {"baseline": baseline_name}
+        for split_name in ["validation_on_X", "test_on_X", "validation_vs_Y", "test_vs_Y"]:
+            if split_name in result_block:
+                row.update(flatten_metric_block(f"{baseline_name}_{split_name}", result_block[split_name]))
+        baseline_rows.append(row)
+
+    save_csv_dicts(baseline_rows, os.path.join(seed_dir, "baseline_metrics_summary.csv"))
+
+    # Figures
+    figures_dir = os.path.join(seed_dir, "figures")
+    plot_training_history(history, title_prefix=f"Benchmark Seed {seed}", save_dir=figures_dir)
+
+    plot_expected_style_figures(
+        Y_true=X_test_true, Y_pred=X_test_hat, history=history,
+        seq_idx=0, channel=1, zoom_start=20, zoom_end=40,
+        bins=30, prefix="deterministic_X_channel2", save_dir=figures_dir
+    )
+    plot_expected_style_figures(
+        Y_true=Y_test_meas, Y_pred=X_test_hat, history=history,
+        seq_idx=0, channel=1, zoom_start=20, zoom_end=40,
+        bins=30, prefix="measured_Y_channel2", save_dir=figures_dir
+    )
+
+    # Return one flat summary row for aggregation
+    seed_row = {
+        "seed": seed,
+        "seed_dir": seed_dir,
+        **flatten_metric_block("validation_on_X", metrics_val_X),
+        **flatten_metric_block("test_on_X", metrics_test_X),
+        **flatten_metric_block("validation_vs_Y", metrics_val_Y),
+        **flatten_metric_block("test_vs_Y", metrics_test_Y),
+        **param_errors
+    }
+    # Append flattened baseline metrics
+    for baseline_name, result_block in baseline_results.items():
+        if not isinstance(result_block, dict):
+            continue
+        for split_name in ["validation_on_X", "test_on_X", "validation_vs_Y", "test_vs_Y"]:
+            if split_name in result_block:
+                seed_row.update(
+                    flatten_metric_block(
+                        f"baseline_{baseline_name}_{split_name}",
+                        result_block[split_name]
+                    )
+                )
+    return seed_row
+
+# ============================================================
+# 16. Main multi-seed driver
+# ============================================================
+
+def main():
+    warnings.filterwarnings("ignore")
+
+    cfg = PlantConfig(
+        in_dim=2,
+        latent_dim=2,
+        out_dim=2,
+        hidden_dim=12,
+        na=2,
+        nb=2,
+        noise_ar_order=1,
+        student_df=5.0
+    )
+    exp = ExperimentConfig()
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    root_dir = os.path.join(exp.output_root, f"multiseed_{DEVICE}_{timestamp}")
+    ensure_dir(root_dir)
+
+    # choose seeds
+    seeds = [1234, 2025, 2026, 3030, 4040]
+
+    save_json(
+        {
+            "device": DEVICE,
+            "seeds": seeds,
+            "plant_config": asdict(cfg),
+            "experiment_config": asdict(exp)
+        },
+        os.path.join(root_dir, "multiseed_run_config.json")
+    )
+
+    all_seed_rows = []
+
+    for seed in seeds:
+        row = run_single_seed(seed=seed, root_dir=root_dir, cfg=cfg, exp=exp)
+        all_seed_rows.append(row)
+
+    # Save per-seed summary
+    save_csv_dicts(all_seed_rows, os.path.join(root_dir, "all_seed_summaries.csv"))
+
+    # Aggregate
+    agg_rows = aggregate_seed_rows(all_seed_rows)
+    save_csv_dicts(agg_rows, os.path.join(root_dir, "aggregate_mean_std.csv"))
+    save_json(
+        {
+            "per_seed": all_seed_rows,
+            "aggregate": agg_rows
+        },
+        os.path.join(root_dir, "aggregate_results.json")
+    )
+    # ========================================================
+    # Compact aggregate summary for baseline comparisons
+    # ========================================================
+    baseline_summary_rows = []
+    baseline_names = ["direct_gru", "linear_arx"]
+
+    for bname in baseline_names:
+        row = {"baseline": bname}
+        for split in ["test_on_X", "test_vs_Y"]:
+            for metric in ["RMSE", "R2", "FIT", "wMAPE"]:
+                key = f"baseline_{bname}_{split}_{metric}"
+                vals = np.array([r.get(key, np.nan) for r in all_seed_rows], dtype=float)
+                if np.all(np.isnan(vals)):
+                    continue
+                row[f"{split}_{metric}_mean"] = float(np.nanmean(vals))
+                row[f"{split}_{metric}_std"] = float(np.nanstd(vals))
+        baseline_summary_rows.append(row)
+
+    save_csv_dicts(baseline_summary_rows, os.path.join(root_dir, "baseline_aggregate_summary.csv"))
+
+    print("\n======================================================")
+    print("MULTI-SEED BENCHMARK COMPLETE")
+    print(f"All outputs saved to:\n  {root_dir}")
+    print("======================================================")
+
+if __name__ == "__main__":
+    main()
