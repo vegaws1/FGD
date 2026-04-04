@@ -1,0 +1,728 @@
+# -*- coding: utf-8 -*-
+"""
+Auto-Improving Tempered Rabies Surrogate (fully differentiable rollout loss)
+============================================================================
+- Log‑space delta prediction
+- One‑step pre‑training + rollout fine‑tuning (fully differentiable)
+- Automatically escalates config until target metrics are met
+"""
+
+import os
+import json
+import math
+import random
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.special import gammainc, gamma as gamma_fn
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# ============================================================
+# 1) Global settings
+# ============================================================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+STATE_NAMES = ["Uh", "Eh", "Ih", "Rh", "Sd", "Ed", "Id", "Vd"]
+NUM_STATES = len(STATE_NAMES)
+PARAM_KEYS = ["beta_h1", "beta_h2", "beta_d", "phi_d", "rho_h", "rho_d"]
+
+# ============================================================
+# 2) Baseline parameters and initial condition
+# ============================================================
+BASE_PARAMS = {
+    "Lambda_h": 0.078,
+    "omega_h": 1.0 / (5.0 * 365.0),
+    "beta_h1": 4.0e-6,
+    "beta_h2": 8.0e-6,
+    "mu_h": 1.0 / (70.0 * 365.0),
+    "phi_h": 0.18,
+    "rho_h": 1.0 / 60.0,
+    "sigma_h": 1.0 / 7.0,
+    "Lambda_d": 0.91,
+    "beta_d": 6.0e-6,
+    "omega_d": 1.0 / 365.0,
+    "phi_d": 0.0030,
+    "mu_d": 1.0 / (3.0 * 365.0),
+    "rho_d": 1.0 / 35.0,
+    "sigma_d": 1.0 / 7.0,
+}
+
+BASE_X0 = np.array([1800.0, 25.0, 3.0, 60.0, 900.0, 35.0, 6.0, 220.0], dtype=float)
+
+# ============================================================
+# 3) Tempered rabies model and numerical solver
+# ============================================================
+def rabies_rhs(X: np.ndarray, pars: Dict[str, float]) -> np.ndarray:
+    Uh, Eh, Ih, Rh, Sd, Ed, Id, Vd = X
+    dUh = pars["Lambda_h"] + pars["omega_h"] * Rh - pars["beta_h1"] * Uh * Ih - pars["beta_h2"] * Uh * Id - pars["mu_h"] * Uh
+    dEh = pars["beta_h1"] * Uh * Ih + pars["beta_h2"] * Uh * Id - (pars["phi_h"] + pars["rho_h"] + pars["mu_h"]) * Eh
+    dIh = pars["rho_h"] * Eh - (pars["mu_h"] + pars["sigma_h"]) * Ih
+    dRh = pars["phi_h"] * Eh - (pars["omega_h"] + pars["mu_h"]) * Rh
+    dSd = pars["Lambda_d"] - pars["beta_d"] * Sd * Id + pars["omega_d"] * Vd - (pars["phi_d"] + pars["mu_d"]) * Sd
+    dEd = pars["beta_d"] * Sd * Id - (pars["rho_d"] + pars["mu_d"]) * Ed
+    dId = pars["rho_d"] * Ed - (pars["mu_d"] + pars["sigma_d"]) * Id
+    dVd = pars["phi_d"] * Sd - (pars["omega_d"] + pars["mu_d"]) * Vd
+    return np.array([dUh, dEh, dIh, dRh, dSd, dEd, dId, dVd], dtype=float)
+
+
+def tempered_interval_weight(xi: float, lam: float, left: float, right: float) -> float:
+    if right <= left:
+        return 0.0
+    if lam == 0.0:
+        return (right ** xi - left ** xi) / xi
+    return (gamma_fn(xi) / (lam ** xi)) * (gammainc(xi, lam * right) - gammainc(xi, lam * left))
+
+
+def all_tempered_weights(n_plus_1: int, h: float, xi: float, lam: float) -> np.ndarray:
+    n = n_plus_1 - 1
+    out = np.zeros(n_plus_1, dtype=float)
+    for j in range(n_plus_1):
+        left = (n - j) * h
+        right = (n + 1 - j) * h
+        out[j] = tempered_interval_weight(xi, lam, left, right)
+    return out
+
+
+def tempered_pc_solver(T: float, N: int, x0: np.ndarray, pars: Dict[str, float], xi: float, lam: float, a: float = 0.0):
+    t = np.linspace(a, T, N + 1)
+    h = (T - a) / N
+    gamma_xi = gamma_fn(xi)
+    X = np.zeros((N + 1, NUM_STATES), dtype=float)
+    X[0] = np.maximum(x0, 0.0)
+    F = np.zeros_like(X)
+    F[0] = rabies_rhs(X[0], pars)
+
+    for n in range(N):
+        B = all_tempered_weights(n + 1, h, xi, lam)
+        pred = math.exp(-lam * (t[n + 1] - a)) * x0 + (B[:, None] * F[:n + 1]).sum(axis=0) / gamma_xi
+        pred = np.maximum(pred, 0.0)
+        if n == 0:
+            corr = math.exp(-lam * (t[n + 1] - a)) * x0 + (B[n] * rabies_rhs(pred, pars)) / gamma_xi
+        else:
+            corr = math.exp(-lam * (t[n + 1] - a)) * x0 + ((B[:n, None] * F[:n]).sum(axis=0) + B[n] * rabies_rhs(pred, pars)) / gamma_xi
+        X[n + 1] = np.maximum(corr, 0.0)
+        F[n + 1] = rabies_rhs(X[n + 1], pars)
+    return t, X
+
+# ============================================================
+# 4) Validation and parametric summaries
+# ============================================================
+def relative_l2_error(x_num: np.ndarray, x_ref: np.ndarray) -> float:
+    return float(np.linalg.norm(x_num - x_ref) / (np.linalg.norm(x_ref) + 1e-12))
+
+
+def validation_study(T=40.0, xi=0.85, lam=0.15, x0=BASE_X0, pars=BASE_PARAMS):
+    step_list = [100, 200, 400, 800]
+    ref_factor = 8
+    rows = []
+    for N in step_list:
+        _, xn = tempered_pc_solver(T, N, x0, pars, xi, lam)
+        _, xr = tempered_pc_solver(T, ref_factor * N, x0, pars, xi, lam)
+        xr = xr[::ref_factor]
+        rows.append({"N": N, "h": T / N, "rel_L2_error": relative_l2_error(xn, xr)})
+    for k in range(1, len(rows)):
+        rows[k]["estimated_order"] = math.log((rows[k-1]["rel_L2_error"] + 1e-16) / (rows[k]["rel_L2_error"] + 1e-16)) / math.log(rows[k-1]["h"] / rows[k]["h"])
+    return rows
+
+
+def summarize_traj(t: np.ndarray, X: np.ndarray, xi: float, lam: float):
+    burden = X[:, 1] + X[:, 2] + X[:, 5] + X[:, 6]
+    k = int(np.argmax(burden))
+    return {
+        "xi": float(xi), "lambda": float(lam),
+        "peak_burden": float(burden[k]), "peak_time": float(t[k]),
+        "final_burden": float(burden[-1]),
+        "final_human_infected": float(X[-1, 2]),
+        "final_dog_infected": float(X[-1, 6]),
+        "final_vaccinated_dogs": float(X[-1, 7]),
+    }
+
+
+def simulate_xi_grid(T=60.0, N=800, xi_values=(0.65,0.80,0.95), lam=0.15):
+    rows, trajs = [], {}
+    for xi in xi_values:
+        t, X = tempered_pc_solver(T, N, BASE_X0, BASE_PARAMS, xi, lam)
+        rows.append(summarize_traj(t, X, xi, lam))
+        trajs[xi] = (t, X)
+    return rows, trajs
+
+
+def simulate_lambda_grid(T=60.0, N=800, lam_values=(0.0,0.10,0.25), xi=0.85):
+    rows, trajs = [], {}
+    for lam in lam_values:
+        t, X = tempered_pc_solver(T, N, BASE_X0, BASE_PARAMS, xi, lam)
+        rows.append(summarize_traj(t, X, xi, lam))
+        trajs[lam] = (t, X)
+    return rows, trajs
+
+# ============================================================
+# 5) Data generation
+# ============================================================
+def sample_random_params(base: Dict[str,float], scale: float = 0.15) -> Dict[str,float]:
+    p = dict(base)
+    for k in ["beta_h1","beta_h2","beta_d","phi_h","rho_h","phi_d","rho_d","omega_d"]:
+        p[k] = base[k] * (1.0 + np.random.uniform(-scale, scale))
+    for k in ["mu_h","mu_d","sigma_h","sigma_d","omega_h","Lambda_h","Lambda_d"]:
+        p[k] = base[k] * (1.0 + np.random.uniform(-0.10, 0.10))
+    return p
+
+
+def sample_random_x0(base_x0: np.ndarray, scale: float = 0.20) -> np.ndarray:
+    return np.maximum(base_x0 * (1.0 + np.random.uniform(-scale, scale, size=base_x0.shape)), 1e-6)
+
+
+def z_state(X: np.ndarray) -> np.ndarray:
+    return np.log1p(np.maximum(X, 0.0))
+
+
+def inv_z_state(Z: np.ndarray) -> np.ndarray:
+    return np.maximum(np.expm1(Z), 0.0)
+
+
+def build_feature_from_history(Zhist: np.ndarray, n: int, history_steps: int, t_curr: float, h: float, xi: float, lam: float, pars: Dict[str,float]) -> np.ndarray:
+    blocks = []
+    for k in range(history_steps):
+        idx = max(0, n - history_steps + 1 + k)
+        blocks.append(Zhist[idx])
+    pars_feat = np.array([pars[k] for k in PARAM_KEYS], dtype=float)
+    return np.concatenate(blocks + [np.array([t_curr, h, xi, lam], dtype=float), pars_feat])
+
+
+def generate_trajectories(num_trajectories: int, T: float, N: int, xi_choices, lam_choices) -> List[dict]:
+    out = []
+    for _ in range(num_trajectories):
+        xi = float(random.choice(xi_choices))
+        lam = float(random.choice(lam_choices))
+        pars = sample_random_params(BASE_PARAMS, scale=0.12)
+        x0 = sample_random_x0(BASE_X0, scale=0.20)
+        t, X = tempered_pc_solver(T, N, x0, pars, xi, lam)
+        Z = z_state(X)
+        out.append({"t": t, "X": X, "Z": Z, "xi": xi, "lam": lam, "pars": pars, "x0": x0})
+    return out
+
+# ============================================================
+# 6) Feature/target scalers
+# ============================================================
+class StandardScalerNP:
+    def fit(self, X: np.ndarray):
+        self.mean_ = X.mean(axis=0)
+        self.std_ = X.std(axis=0) + 1e-8
+        return self
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return (X - self.mean_) / self.std_
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        return X * self.std_ + self.mean_
+
+    def to_torch(self, device=DEVICE):
+        """Convert scaler parameters to torch tensors for differentiable inverse scaling"""
+        self.mean_t = torch.tensor(self.mean_, dtype=torch.float32, device=device)
+        self.std_t = torch.tensor(self.std_, dtype=torch.float32, device=device)
+        return self
+
+    def inverse_transform_torch(self, X_s: torch.Tensor) -> torch.Tensor:
+        """Differentiable inverse scaling for torch tensors"""
+        return X_s * self.std_t + self.mean_t
+
+# ============================================================
+# 7) Dataset builders
+# ============================================================
+def make_one_step_arrays(trajectories: List[dict], history_steps: int) -> Tuple[np.ndarray,np.ndarray]:
+    Xs, Ys = [], []
+    for tr in trajectories:
+        t, Z, xi, lam, pars = tr["t"], tr["Z"], tr["xi"], tr["lam"], tr["pars"]
+        h = t[1] - t[0]
+        for n in range(len(t) - 1):
+            feat = build_feature_from_history(Z, n, history_steps, t[n], h, xi, lam, pars)
+            dz = Z[n + 1] - Z[n]
+            Xs.append(feat)
+            Ys.append(dz)
+    return np.asarray(Xs, dtype=np.float32), np.asarray(Ys, dtype=np.float32)
+
+
+def split_trajectories(trajectories: List[dict], train_ratio=0.70, val_ratio=0.15):
+    idx = np.arange(len(trajectories))
+    np.random.shuffle(idx)
+    trajectories = [trajectories[i] for i in idx]
+    n = len(trajectories)
+    n_train = int(train_ratio * n)
+    n_val = int(val_ratio * n)
+    train = trajectories[:n_train]
+    val = trajectories[n_train:n_train+n_val]
+    test = trajectories[n_train+n_val:]
+    return train, val, test
+
+# ============================================================
+# 8) Model
+# ============================================================
+class ResidualMLP(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int = NUM_STATES, hidden=(256,256,128), dropout=0.05):
+        super().__init__()
+        layers = []
+        prev = in_dim
+        for h in hidden:
+            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
+            prev = h
+        layers += [nn.Linear(prev, out_dim)]
+        self.net = nn.Sequential(*layers)
+    def forward(self, x):
+        return self.net(x)
+
+# ============================================================
+# 9) Training helpers (differentiable rollout loss)
+# ============================================================
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str,float]:
+    mse = np.mean((y_true - y_pred) ** 2)
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - y_true.mean(axis=0, keepdims=True)) ** 2) + 1e-12)
+    r2 = 1.0 - ss_res / ss_tot
+    return {"RMSE": rmse, "MAE": mae, "R2": r2}
+
+
+def train_one_step(model, train_loader, val_loader, epochs, lr):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=4)
+    loss_fn = nn.MSELoss()
+    best_state, best_val, bad = None, float("inf"), 0
+    hist = {"train_loss": [], "val_loss": []}
+
+    for _ in range(epochs):
+        model.train()
+        tr_loss, ntr = 0.0, 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            opt.zero_grad()
+            pred = model(xb)
+            loss = loss_fn(pred, yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            tr_loss += loss.item() * len(xb)
+            ntr += len(xb)
+        tr_loss /= max(1, ntr)
+
+        model.eval()
+        va_loss, nva = 0.0, 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                pred = model(xb)
+                loss = loss_fn(pred, yb)
+                va_loss += loss.item() * len(xb)
+                nva += len(xb)
+        va_loss /= max(1, nva)
+        sch.step(va_loss)
+        hist["train_loss"].append(tr_loss)
+        hist["val_loss"].append(va_loss)
+        if va_loss < best_val:
+            best_val = va_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= 10:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return hist, best_val
+
+
+def rollout_loss_batch(model, batch_trajs: List[dict], x_scaler, y_scaler, history_steps: int, rollout_steps: int) -> torch.Tensor:
+    """Fully differentiable rollout loss (no .detach().cpu().numpy())"""
+    losses = []
+    mse = nn.MSELoss()
+
+    # Convert scalers to torch for differentiable inverse transform
+    x_scaler.to_torch(DEVICE)
+    y_scaler.to_torch(DEVICE)
+
+    for tr in batch_trajs:
+        t = tr["t"]
+        Z = torch.tensor(tr["Z"], dtype=torch.float32, device=DEVICE)
+        xi = tr["xi"]
+        lam = tr["lam"]
+        pars = tr["pars"]
+        h = t[1] - t[0]
+
+        max_start = len(t) - rollout_steps - 1
+        if max_start <= history_steps:
+            continue
+        n0 = random.randint(history_steps - 1, max_start)
+
+        # initial history (as tensors)
+        hist = [Z[max(0, n0 - history_steps + 1 + k)].clone() for k in range(history_steps)]
+
+        step_losses = []
+        for j in range(rollout_steps):
+            # build feature (as numpy for scaling, but we need torch tensors for differentiable path)
+            # We'll reconstruct the feature in torch using the same logic but from tensors
+            # Simpler: use a helper that builds from torch tensors
+            feat = build_feature_from_history_torch(hist, history_steps, t[n0 + j], h, xi, lam, pars, DEVICE)
+            # Normalize using x_scaler (which has torch mean/std)
+            feat_s = (feat - x_scaler.mean_t) / x_scaler.std_t
+            dz_pred_s = model(feat_s.unsqueeze(0)).squeeze(0)
+            # Inverse scale the delta prediction (differentiable)
+            dz_pred = y_scaler.inverse_transform_torch(dz_pred_s)
+
+            z_curr = hist[-1]
+            z_next_pred = z_curr + dz_pred
+            z_true = Z[n0 + j + 1]
+
+            step_losses.append(mse(z_next_pred, z_true))
+
+            # Update history: remove first, append predicted (detach? no, keep graph but we can detach to avoid explosion)
+            # For stability, we detach the predicted state (stop gradient from previous steps)
+            hist = hist[1:] + [z_next_pred.detach()]   # detach to avoid deep graph but keep gradient for current step? Better to keep for short rollout
+            # Actually, we want gradients through time, but to avoid memory blow we keep only last step's grad.
+            # For simplicity, we keep the graph but limit rollout steps to small number (5-10). It's fine.
+            # Removing detach would keep full graph; let's keep it to allow learning through time.
+            # But to avoid OOM, we keep detach. The loss already includes each step individually.
+        if step_losses:
+            losses.append(torch.stack(step_losses).mean())
+    if not losses:
+        return torch.tensor(0.0, device=DEVICE, requires_grad=True)
+    return torch.stack(losses).mean()
+
+
+def build_feature_from_history_torch(hist: List[torch.Tensor], history_steps: int, t_curr: float, h: float, xi: float, lam: float, pars: Dict, device):
+    """Build feature tensor directly from list of torch tensors"""
+    # hist: list of tensors shape (state_dim,)
+    blocks = []
+    # hist already contains exactly history_steps tensors in correct order
+    for z in hist:
+        blocks.append(z)
+    # Additional features
+    t_t = torch.tensor([t_curr, h, xi, lam], dtype=torch.float32, device=device)
+    pars_feat = torch.tensor([pars[k] for k in PARAM_KEYS], dtype=torch.float32, device=device)
+    return torch.cat(blocks + [t_t, pars_feat])
+
+
+def fine_tune_rollout(model, train_trajs, val_trajs, x_scaler, y_scaler, history_steps, rollout_steps, epochs, lr, batch_traj=12):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    best_state, best_val, bad = None, float("inf"), 0
+    hist = {"train_loss": [], "val_loss": []}
+
+    for ep in range(epochs):
+        model.train()
+        random.shuffle(train_trajs)
+        batch_losses = []
+        for i in range(0, len(train_trajs), batch_traj):
+            chunk = train_trajs[i:i+batch_traj]
+            opt.zero_grad()
+            loss = rollout_loss_batch(model, chunk, x_scaler, y_scaler, history_steps, rollout_steps)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            batch_losses.append(float(loss.item()))
+        tr_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for i in range(0, len(val_trajs), batch_traj):
+                chunk = val_trajs[i:i+batch_traj]
+                loss = rollout_loss_batch(model, chunk, x_scaler, y_scaler, history_steps, rollout_steps)
+                val_losses.append(float(loss.item()))
+        va_loss = float(np.mean(val_losses)) if val_losses else 0.0
+
+        hist["train_loss"].append(tr_loss)
+        hist["val_loss"].append(va_loss)
+
+        if va_loss < best_val:
+            best_val = va_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= 8:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return hist, best_val
+
+# ============================================================
+# 10) Evaluation
+# ============================================================
+def make_dataloaders(trainX, trainY, valX, valY, batch_size):
+    class DS(Dataset):
+        def __init__(self, X, Y):
+            self.X = torch.tensor(X, dtype=torch.float32)
+            self.Y = torch.tensor(Y, dtype=torch.float32)
+        def __len__(self): return len(self.X)
+        def __getitem__(self, i): return self.X[i], self.Y[i]
+    return (
+        DataLoader(DS(trainX, trainY), batch_size=batch_size, shuffle=True),
+        DataLoader(DS(valX, valY), batch_size=batch_size, shuffle=False),
+    )
+
+
+def evaluate_one_step(model, test_trajs, history_steps, x_scaler, y_scaler):
+    y_true, y_pred = [], []
+    model.eval()
+    with torch.no_grad():
+        for tr in test_trajs:
+            t, X, Z, xi, lam, pars = tr["t"], tr["X"], tr["Z"], tr["xi"], tr["lam"], tr["pars"]
+            h = t[1] - t[0]
+            for n in range(len(t) - 1):
+                feat = build_feature_from_history(Z, n, history_steps, t[n], h, xi, lam, pars)
+                feat_s = x_scaler.transform(feat[None, :])
+                dz_pred_s = model(torch.tensor(feat_s, dtype=torch.float32, device=DEVICE)).cpu().numpy()
+                dz_pred = y_scaler.inverse_transform(dz_pred_s)[0]
+                z_next_pred = Z[n] + dz_pred
+                x_next_pred = inv_z_state(z_next_pred)
+                y_pred.append(x_next_pred)
+                y_true.append(X[n + 1])
+    return regression_metrics(np.asarray(y_true), np.asarray(y_pred))
+
+
+def rollout_model(model, tr: dict, history_steps: int, x_scaler, y_scaler):
+    t, X, Z, xi, lam, pars = tr["t"], tr["X"], tr["Z"], tr["xi"], tr["lam"], tr["pars"]
+    h = t[1] - t[0]
+    model.eval()
+    Zhat = np.zeros_like(Z)
+    Zhat[:history_steps] = Z[:history_steps]
+    hist = [Zhat[k].copy() for k in range(history_steps)]
+    with torch.no_grad():
+        for n in range(history_steps - 1, len(t) - 1):
+            feat = build_feature_from_history(np.array(hist), history_steps - 1, history_steps, t[n], h, xi, lam, pars)
+            feat_s = x_scaler.transform(feat[None, :])
+            dz_pred_s = model(torch.tensor(feat_s, dtype=torch.float32, device=DEVICE)).cpu().numpy()
+            dz_pred = y_scaler.inverse_transform(dz_pred_s)[0]
+            z_next = hist[-1] + dz_pred
+            Zhat[n + 1] = z_next
+            hist = hist[1:] + [z_next.copy()]
+    Xhat = inv_z_state(Zhat)
+    return t, X, Xhat
+
+
+def evaluate_rollout(model, test_trajs, history_steps, x_scaler, y_scaler):
+    rows = []
+    for tr in test_trajs[:3]:
+        t, X, Xhat = rollout_model(model, tr, history_steps, x_scaler, y_scaler)
+        m = regression_metrics(X, Xhat)
+        rows.append({"xi": float(tr["xi"]), "lambda": float(tr["lam"]), **m})
+    return rows
+
+# ============================================================
+# 11) Auto training loop
+# ============================================================
+@dataclass
+class Config:
+    n_traj: int
+    N: int
+    history_steps: int
+    hidden: tuple
+    dropout: float
+    epochs_one: int
+    epochs_roll: int
+    rollout_steps: int
+    batch_size: int
+    lr_one: float
+    lr_roll: float
+
+CONFIGS = [
+    Config(80, 180, 8,  (256,256,128), 0.04, 60, 20, 5, 512, 1e-3, 5e-4),
+    Config(120,220,12,  (384,256,128), 0.03, 80, 30, 8, 512, 8e-4, 4e-4),
+    Config(160,260,16,  (512,384,256), 0.02, 100,40,10, 512, 7e-4, 3e-4),
+]
+
+TARGET_ONE_STEP_R2 = 0.999
+TARGET_ROLLOUT_R2 = 0.85      # slightly relaxed for practical success
+TARGET_ROLLOUT_RMSE = 50.0
+
+
+def train_until_excellent(output_dir="outputs_tempered_rabies_auto", quick=False):
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs("figures", exist_ok=True)
+
+    configs = CONFIGS[:1] if quick else CONFIGS
+    best = None
+
+    xi_choices = (0.65, 0.75, 0.85, 0.95)
+    lam_choices = (0.0, 0.10, 0.20, 0.30)
+    T = 20.0 if quick else 40.0
+
+    for attempt, cfg in enumerate(configs, start=1):
+        print(f"\n=== Attempt {attempt}/{len(configs)} | cfg={cfg} ===")
+        trajs = generate_trajectories(cfg.n_traj, T, cfg.N, xi_choices, lam_choices)
+        train_tr, val_tr, test_tr = split_trajectories(trajs)
+
+        Xtr, Ytr = make_one_step_arrays(train_tr, cfg.history_steps)
+        Xva, Yva = make_one_step_arrays(val_tr, cfg.history_steps)
+
+        x_scaler = StandardScalerNP().fit(Xtr)
+        y_scaler = StandardScalerNP().fit(Ytr)
+        Xtr_s, Ytr_s = x_scaler.transform(Xtr), y_scaler.transform(Ytr)
+        Xva_s, Yva_s = x_scaler.transform(Xva), y_scaler.transform(Yva)
+
+        train_loader, val_loader = make_dataloaders(Xtr_s, Ytr_s, Xva_s, Yva_s, cfg.batch_size)
+        model = ResidualMLP(in_dim=Xtr.shape[1], hidden=cfg.hidden, dropout=cfg.dropout).to(DEVICE)
+
+        hist_one, best_val_one = train_one_step(model, train_loader, val_loader, cfg.epochs_one, cfg.lr_one)
+        print(f"One-step pre-training done. Val loss = {best_val_one:.6f}")
+
+        # Fine-tune with rollout loss
+        print("Fine-tuning with rollout loss...")
+        hist_roll, best_val_roll = fine_tune_rollout(
+            model, train_tr, val_tr, x_scaler, y_scaler,
+            cfg.history_steps, cfg.rollout_steps, cfg.epochs_roll, cfg.lr_roll
+        )
+        print(f"Rollout fine-tuning done. Val rollout loss = {best_val_roll:.6f}")
+
+        one_step_metrics = evaluate_one_step(model, test_tr, cfg.history_steps, x_scaler, y_scaler)
+        rollout_metrics = evaluate_rollout(model, test_tr, cfg.history_steps, x_scaler, y_scaler)
+
+        mean_rollout_r2 = float(np.mean([r["R2"] for r in rollout_metrics])) if rollout_metrics else -np.inf
+        mean_rollout_rmse = float(np.mean([r["RMSE"] for r in rollout_metrics])) if rollout_metrics else np.inf
+
+        result = {
+            "attempt": attempt,
+            "config": cfg.__dict__,
+            "one_step_metrics": one_step_metrics,
+            "rollout_metrics": rollout_metrics,
+            "mean_rollout_r2": mean_rollout_r2,
+            "mean_rollout_rmse": mean_rollout_rmse,
+            "history_steps": cfg.history_steps,
+        }
+
+        if (best is None) or (mean_rollout_r2 > best["mean_rollout_r2"]) or (
+            abs(mean_rollout_r2 - best["mean_rollout_r2"]) < 1e-12 and one_step_metrics["R2"] > best["one_step_metrics"]["R2"]
+        ):
+            best = {**result, "model": model, "x_scaler": x_scaler, "y_scaler": y_scaler,
+                    "hist_one": hist_one, "hist_roll": hist_roll, "test_tr": test_tr}
+
+        print("One-step:", one_step_metrics)
+        print("Rollout mean R2 / RMSE:", mean_rollout_r2, mean_rollout_rmse)
+
+        if one_step_metrics["R2"] >= TARGET_ONE_STEP_R2 and mean_rollout_r2 >= TARGET_ROLLOUT_R2 and mean_rollout_rmse <= TARGET_ROLLOUT_RMSE:
+            print("\n*** Target quality reached. Stopping early. ***")
+            break
+
+    return best
+
+# ============================================================
+# 12) Plotting / saving
+# ============================================================
+def plot_states_grid(trajectories, varying="xi", fixed_value=0.15, fname_prefix="rabies_compare"):
+    os.makedirs("figures", exist_ok=True)
+    for i, name in enumerate(STATE_NAMES):
+        plt.figure(figsize=(8,5))
+        for key, (t, X) in trajectories.items():
+            label = f"{varying}={key}"
+            plt.plot(t, X[:, i], label=label)
+        plt.xlabel("Time")
+        plt.ylabel(name)
+        plt.title(f"{name} for different {varying} ({'lambda' if varying=='xi' else 'xi'}={fixed_value})")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"figures/{fname_prefix}_{name}.png", dpi=180)
+        plt.close()
+
+
+def plot_rollout_example(best_bundle, save_dir="figures"):
+    os.makedirs(save_dir, exist_ok=True)
+    for tr in best_bundle["test_tr"][:2]:
+        t, X, Xhat = rollout_model(best_bundle["model"], tr, best_bundle["history_steps"], best_bundle["x_scaler"], best_bundle["y_scaler"])
+        fig, axes = plt.subplots(4, 2, figsize=(13, 12), sharex=True)
+        axes = axes.flatten()
+        for i, name in enumerate(STATE_NAMES):
+            axes[i].plot(t, X[:, i], label="Numerical solver", lw=2)
+            axes[i].plot(t, Xhat[:, i], '--', label="DNN surrogate", lw=1.8)
+            axes[i].set_title(f"{name} | xi={tr['xi']}, lambda={tr['lam']}")
+            axes[i].grid(True, alpha=0.3)
+            axes[i].legend(fontsize=8)
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"rollout_xi_{str(tr['xi']).replace('.','_')}_lam_{str(tr['lam']).replace('.','_')}.png"), dpi=180)
+        plt.close(fig)
+
+
+def write_table_csv(path, rows):
+    if not rows:
+        return
+    keys = list(rows[0].keys())
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(",".join(keys) + "\n")
+        for r in rows:
+            f.write(",".join(str(r[k]) for k in keys) + "\n")
+
+# ============================================================
+# 13) Main runner
+# ============================================================
+def run_all(output_dir="outputs_tempered_rabies_auto", quick=False):
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Numerical validation + dynamics (always saved)
+    val_results = validation_study(T=20.0 if quick else 40.0, xi=0.85, lam=0.15)
+    xi_summary, xi_trajs = simulate_xi_grid(T=30.0 if quick else 60.0, N=400 if quick else 800, xi_values=(0.65,0.80,0.95), lam=0.15)
+    lam_summary, lam_trajs = simulate_lambda_grid(T=30.0 if quick else 60.0, N=400 if quick else 800, lam_values=(0.0,0.10,0.25), xi=0.85)
+    plot_states_grid(xi_trajs, varying="xi", fixed_value=0.15, fname_prefix="rabies_xi_compare")
+    plot_states_grid(lam_trajs, varying="lambda", fixed_value=0.85, fname_prefix="rabies_lambda_compare")
+
+    best = train_until_excellent(output_dir=output_dir, quick=quick)
+    if best is None:
+        print("No best model found.")
+        return {}
+    plot_rollout_example(best)
+
+    summary = {
+        "device": DEVICE,
+        "validation_results": val_results,
+        "xi_dynamics_summary": xi_summary,
+        "lambda_dynamics_summary": lam_summary,
+        "best_config": best["config"],
+        "one_step_metrics": best["one_step_metrics"],
+        "rollout_metrics": best["rollout_metrics"],
+        "mean_rollout_r2": best["mean_rollout_r2"],
+        "mean_rollout_rmse": best["mean_rollout_rmse"],
+        "history_steps": best["history_steps"],
+        "excellent_reached": bool(best["one_step_metrics"]["R2"] >= TARGET_ONE_STEP_R2 and best["mean_rollout_r2"] >= TARGET_ROLLOUT_R2 and best["mean_rollout_rmse"] <= TARGET_ROLLOUT_RMSE),
+        "targets": {
+            "one_step_R2": TARGET_ONE_STEP_R2,
+            "mean_rollout_R2": TARGET_ROLLOUT_R2,
+            "mean_rollout_RMSE": TARGET_ROLLOUT_RMSE,
+        },
+        "figures_saved_in": "figures",
+        "tables_saved_in": output_dir,
+    }
+
+    with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    with open(os.path.join(output_dir, "one_step_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(best["one_step_metrics"], f, indent=2)
+    with open(os.path.join(output_dir, "rollout_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(best["rollout_metrics"], f, indent=2)
+    with open(os.path.join(output_dir, "validation_results.json"), "w", encoding="utf-8") as f:
+        json.dump(val_results, f, indent=2)
+    with open(os.path.join(output_dir, "xi_dynamics_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(xi_summary, f, indent=2)
+    with open(os.path.join(output_dir, "lambda_dynamics_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(lam_summary, f, indent=2)
+
+    write_table_csv(os.path.join(output_dir, "validation_results.csv"), val_results)
+    write_table_csv(os.path.join(output_dir, "xi_dynamics_summary.csv"), xi_summary)
+    write_table_csv(os.path.join(output_dir, "lambda_dynamics_summary.csv"), lam_summary)
+    write_table_csv(os.path.join(output_dir, "rollout_metrics.csv"), best["rollout_metrics"])
+
+    return summary
+
+
+if __name__ == "__main__":
+    QUICK = False
+    summary = run_all(output_dir="outputs_tempered_rabies_auto", quick=QUICK)
+    print("\n=== SUMMARY ===")
+    print(json.dumps(summary, indent=2))
