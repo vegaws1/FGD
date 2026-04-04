@@ -1,0 +1,851 @@
+import os
+import json
+import math
+import random
+from typing import Dict, Callable
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")   # safer for scripts / notebooks without GUI
+import matplotlib.pyplot as plt
+
+from scipy.integrate import solve_ivp
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+
+# ============================================================
+# 1) Reproducibility
+# ============================================================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ============================================================
+# 2) Baseline HBV parameters (six-compartment model)
+# ============================================================
+BASE_PARAMS = {
+    "Psi": 12.0,      # recruitment
+    "Pi": 0.65,       # fraction recruited into S
+    "beta1": 0.65,    # acute-to-S transmission
+    "beta2": 0.30,    # chronic-to-S transmission
+    "beta3": 0.18,    # acute-to-V breakthrough transmission
+    "beta4": 0.08,    # chronic-to-V breakthrough transmission
+    "eta": 0.05,      # waning immunity
+    "gamma": 0.22,    # vaccination of susceptibles
+    "alpha1": 0.18,   # acute -> chronic
+    "alpha2": 0.35,   # acute -> recovered
+    "rho1": 0.08,     # acute -> hospitalized
+    "gamma1": 0.14,   # chronic -> recovered
+    "rho2": 0.06,     # chronic -> hospitalized
+    "gamma2": 0.03,   # chronic disease-induced mortality
+    "rho3": 0.16,     # hospitalized -> recovered
+    "rho4": 0.05,     # hospitalized disease-induced mortality
+    "chi": 0.015      # natural mortality
+}
+
+STATE_NAMES = ["S", "I1", "I2", "H", "R", "V"]
+
+# Reasonable nonnegative initial condition
+BASE_X0 = np.array([800.0, 20.0, 10.0, 5.0, 120.0, 220.0], dtype=float)
+
+
+# ============================================================
+# 3) GCD kernels psi(t,p) and stretched-time increments
+#    We deliberately include multiple kernels (not only canonical)
+# ============================================================
+# All kernels satisfy psi(t,1)=1 and psi>0.
+
+def psi_canonical(t, p, eps=1e-6):
+    return np.power(t + eps, 1.0 - p)
+
+def psi_shifted_power(t, p):
+    return np.power(1.0 + t, 1.0 - p)
+
+def psi_rational(t, p):
+    # Positive, bounded away from zero, psi(t,1)=1
+    return 1.0 / (1.0 + (1.0 - p) * t)
+
+def psi_exponential(t, p):
+    # Positive, psi(t,1)=1, no singularity at t=0
+    return np.exp((1.0 - p) * t / (1.0 + t))
+
+KERNELS: Dict[str, Callable] = {
+    "canonical_power": psi_canonical,
+    "shifted_power": psi_shifted_power,
+    "rational": psi_rational,
+    "exponential": psi_exponential,
+}
+
+
+def theta_grid(t_grid: np.ndarray, p: float, kernel_name: str) -> np.ndarray:
+    """
+    Compute tau_n = Theta_p(t_n)=int_0^{t_n} 1/psi(s,p) ds.
+    Uses exact formulas when available, otherwise cumulative trapezoid.
+    """
+    psi = KERNELS[kernel_name]
+    t_grid = np.asarray(t_grid, dtype=float)
+
+    if kernel_name == "canonical_power":
+        eps = 1e-6
+        return (np.power(t_grid + eps, p) - eps ** p) / p
+
+    elif kernel_name == "shifted_power":
+        return (np.power(1.0 + t_grid, p) - 1.0) / p
+
+    elif kernel_name == "rational":
+        # 1/psi = 1 + (1-p)t
+        return t_grid + 0.5 * (1.0 - p) * t_grid ** 2
+
+    else:
+        # generic trapezoidal quadrature
+        vals = 1.0 / psi(t_grid, p)
+        tau = np.zeros_like(t_grid, dtype=float)
+        for i in range(1, len(t_grid)):
+            dt = t_grid[i] - t_grid[i - 1]
+            tau[i] = tau[i - 1] + 0.5 * dt * (vals[i] + vals[i - 1])
+        return tau
+
+
+# ============================================================
+# 4) HBV vector field F(X)
+# ============================================================
+def hbv_rhs(X: np.ndarray, pars: Dict[str, float]) -> np.ndarray:
+    S, I1, I2, H, R, V = X
+    N = max(np.sum(X), 1e-12)
+
+    Psi = pars["Psi"]
+    Pi = pars["Pi"]
+    beta1 = pars["beta1"]
+    beta2 = pars["beta2"]
+    beta3 = pars["beta3"]
+    beta4 = pars["beta4"]
+    eta = pars["eta"]
+    gamma = pars["gamma"]
+    alpha1 = pars["alpha1"]
+    alpha2 = pars["alpha2"]
+    rho1 = pars["rho1"]
+    gamma1 = pars["gamma1"]
+    rho2 = pars["rho2"]
+    gamma2 = pars["gamma2"]
+    rho3 = pars["rho3"]
+    rho4 = pars["rho4"]
+    chi = pars["chi"]
+
+    dS = (
+        Psi * Pi
+        - beta1 * S * I1 / N
+        - beta2 * S * I2 / N
+        + eta * V
+        - (gamma + chi) * S
+    )
+
+    dI1 = (
+        beta1 * S * I1 / N
+        + beta2 * S * I2 / N
+        + beta3 * V * I1 / N
+        + beta4 * V * I2 / N
+        - (alpha1 + alpha2 + rho1 + chi) * I1
+    )
+
+    dI2 = alpha1 * I1 - (gamma1 + rho2 + gamma2 + chi) * I2
+    dH = rho1 * I1 + rho2 * I2 - (rho3 + rho4 + chi) * H
+    dR = gamma1 * I2 + alpha2 * I1 + rho3 * H - chi * R
+
+    dV = (
+        Psi * (1.0 - Pi)
+        + gamma * S
+        - beta3 * V * I1 / N
+        - beta4 * V * I2 / N
+        - (eta + chi) * V
+    )
+
+    return np.array([dS, dI1, dI2, dH, dR, dV], dtype=float)
+
+
+def project_nonnegative(x: np.ndarray) -> np.ndarray:
+    return np.maximum(x, 0.0)
+
+
+# ============================================================
+# 5) Predictor-corrector solver in stretched time tau
+# ============================================================
+def gcd_predictor_corrector(
+    T: float,
+    N: int,
+    x0: np.ndarray,
+    pars: Dict[str, float],
+    p: float,
+    kernel_name: str
+):
+    t_grid = np.linspace(0.0, T, N + 1)
+    tau_grid = theta_grid(t_grid, p, kernel_name)
+
+    x = np.zeros((N + 1, len(x0)), dtype=float)
+    x[0] = np.array(x0, dtype=float)
+
+    for n in range(N):
+        dtau = tau_grid[n + 1] - tau_grid[n]
+        Fn = hbv_rhs(x[n], pars)
+
+        # predictor
+        x_pred = project_nonnegative(x[n] + dtau * Fn)
+
+        # corrector
+        x[n + 1] = project_nonnegative(
+            x[n] + 0.5 * dtau * (Fn + hbv_rhs(x_pred, pars))
+        )
+
+    return t_grid, tau_grid, x
+
+
+# ============================================================
+# 6) High-accuracy reference solver using solve_ivp on dX/dtau = F(X)
+# ============================================================
+def reference_solution(
+    T: float,
+    x0: np.ndarray,
+    pars: Dict[str, float],
+    p: float,
+    kernel_name: str,
+    t_eval: np.ndarray
+):
+    tau_eval = theta_grid(t_eval, p, kernel_name)
+    tau_T = tau_eval[-1]
+
+    def rhs_tau(tau, y):
+        return hbv_rhs(np.maximum(y, 0.0), pars)
+
+    sol = solve_ivp(
+        rhs_tau,
+        [0.0, tau_T],
+        x0,
+        method="DOP853",
+        t_eval=tau_eval,
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
+    x_ref = np.maximum(sol.y.T, 0.0)
+    return x_ref
+
+
+# ============================================================
+# 7) Numerical validation experiment (error study)
+# ============================================================
+def relative_l2_error(x_num: np.ndarray, x_ref: np.ndarray) -> float:
+    num = np.linalg.norm(x_num - x_ref)
+    den = np.linalg.norm(x_ref) + 1e-12
+    return float(num / den)
+
+
+def validation_study(
+    T=40.0,
+    p=0.85,
+    kernel_name="shifted_power",
+    x0=BASE_X0,
+    pars=BASE_PARAMS
+):
+    step_list = [200, 400, 800, 1600]
+    results = []
+
+    for N in step_list:
+        t_grid, _, x_num = gcd_predictor_corrector(T, N, x0, pars, p, kernel_name)
+        x_ref = reference_solution(T, x0, pars, p, kernel_name, t_grid)
+        err = relative_l2_error(x_num, x_ref)
+        results.append({"N": N, "h": T / N, "rel_L2_error": err})
+
+    for k in range(1, len(results)):
+        e1 = results[k - 1]["rel_L2_error"]
+        e2 = results[k]["rel_L2_error"]
+        h1 = results[k - 1]["h"]
+        h2 = results[k]["h"]
+        results[k]["estimated_order"] = math.log(e1 / e2) / math.log(h1 / h2)
+
+    return results
+
+
+# ============================================================
+# 8) Kernel comparison for dynamics
+# ============================================================
+def simulate_kernel_grid(
+    T=60.0,
+    N=1200,
+    p_values=(0.65, 0.80, 0.95),
+    x0=BASE_X0,
+    pars=BASE_PARAMS,
+):
+    summary = []
+    trajectories = {}
+
+    for kernel_name in KERNELS:
+        trajectories[kernel_name] = {}
+
+        for p in p_values:
+            t, tau, x = gcd_predictor_corrector(T, N, x0, pars, p, kernel_name)
+            trajectories[kernel_name][p] = (t, x)
+
+            I_total = x[:, 1] + x[:, 2] + x[:, 3]
+            peak_idx = int(np.argmax(I_total))
+
+            summary.append(
+                {
+                    "kernel": kernel_name,
+                    "p": p,
+                    "peak_infected_total": float(I_total[peak_idx]),
+                    "peak_time": float(t[peak_idx]),
+                    "final_infected_total": float(I_total[-1]),
+                    "final_vaccinated": float(x[-1, 5]),
+                    "final_recovered": float(x[-1, 4]),
+                }
+            )
+
+    return summary, trajectories
+
+
+# ============================================================
+# 9) Dataset generation for DNN surrogate
+#    one-step transition samples:
+#    input  = [state_n (6), dtau, p, kernel_one_hot (4), selected params (3)]
+#    target = state_{n+1} (6)
+# ============================================================
+def sample_random_params(base: Dict[str, float], scale=0.15) -> Dict[str, float]:
+    pars = dict(base)
+
+    # perturb selected influential parameters
+    for key in ["beta1", "beta2", "gamma", "alpha1", "alpha2", "eta", "rho1", "rho2"]:
+        pars[key] = base[key] * (1.0 + np.random.uniform(-scale, scale))
+
+    pars["Pi"] = min(max(base["Pi"] + np.random.uniform(-0.05, 0.05), 0.4), 0.9)
+    return pars
+
+
+def sample_random_x0(base_x0: np.ndarray, scale=0.25) -> np.ndarray:
+    x0 = base_x0 * (1.0 + np.random.uniform(-scale, scale, size=base_x0.shape))
+    return np.maximum(x0, 1e-6)
+
+
+def kernel_one_hot(kernel_name: str) -> np.ndarray:
+    names = list(KERNELS.keys())
+    vec = np.zeros(len(names), dtype=float)
+    vec[names.index(kernel_name)] = 1.0
+    return vec
+
+
+def generate_surrogate_dataset(
+    num_trajectories=60,
+    T=40.0,
+    N=250,
+    p_choices=(0.65, 0.75, 0.85, 0.95),
+):
+    X_inputs = []
+    Y_targets = []
+    meta = []
+
+    kernels = list(KERNELS.keys())
+
+    for i in range(num_trajectories):
+        kernel_name = random.choice(kernels)
+        p = random.choice(p_choices)
+        pars = sample_random_params(BASE_PARAMS, scale=0.12)
+        x0 = sample_random_x0(BASE_X0, scale=0.20)
+
+        t_grid, tau_grid, x = gcd_predictor_corrector(T, N, x0, pars, p, kernel_name)
+        kernel_vec = kernel_one_hot(kernel_name)
+
+        # a few selected parameter features
+        pars_feat = np.array([pars["beta1"], pars["beta2"], pars["gamma"]], dtype=float)
+
+        for n in range(N):
+            dtau = tau_grid[n + 1] - tau_grid[n]
+            feat = np.concatenate([x[n], [dtau, p], kernel_vec, pars_feat])
+            X_inputs.append(feat)
+            Y_targets.append(x[n + 1])
+
+        meta.append(
+            {
+                "kernel": kernel_name,
+                "p": p,
+                "params": pars,
+                "x0": x0.tolist(),
+            }
+        )
+
+    X_inputs = np.asarray(X_inputs, dtype=np.float32)
+    Y_targets = np.asarray(Y_targets, dtype=np.float32)
+    return X_inputs, Y_targets, meta
+
+
+# ============================================================
+# 10) Scaler, dataset, and MLP model
+# ============================================================
+class StandardScalerNP:
+    def fit(self, X):
+        self.mean_ = X.mean(axis=0)
+        self.std_ = X.std(axis=0) + 1e-8
+        return self
+
+    def transform(self, X):
+        return (X - self.mean_) / self.std_
+
+    def inverse_transform(self, X):
+        return X * self.std_ + self.mean_
+
+
+class ArrayDataset(Dataset):
+    def __init__(self, X, Y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.Y = torch.tensor(Y, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.Y[idx]
+
+
+class MLPRegressor(nn.Module):
+    def __init__(self, in_dim, out_dim=6, hidden=(128, 128, 64), dropout=0.05):
+        super().__init__()
+        layers = []
+        prev = in_dim
+        for h in hidden:
+            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
+            prev = h
+        layers += [nn.Linear(prev, out_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ============================================================
+# 11) Metrics and training utilities
+# ============================================================
+def regression_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    mse = np.mean((y_true - y_pred) ** 2)
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - y_true.mean(axis=0, keepdims=True)) ** 2) + 1e-12)
+    r2 = 1.0 - ss_res / ss_tot
+
+    return {"RMSE": rmse, "MAE": mae, "R2": r2}
+
+
+def get_optimizer(name, params, lr=1e-3, weight_decay=1e-5):
+    name = name.lower()
+
+    if name == "adam":
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    elif name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    elif name == "rmsprop":
+        return torch.optim.RMSprop(params, lr=lr, weight_decay=weight_decay, momentum=0.9)
+    elif name == "sgd":
+        return torch.optim.SGD(params, lr=lr, weight_decay=weight_decay, momentum=0.9, nesterov=True)
+    elif name == "adagrad":
+        return torch.optim.Adagrad(params, lr=lr, weight_decay=weight_decay)
+    elif name == "nadam":
+        return torch.optim.NAdam(params, lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer: {name}")
+
+
+def train_single_model(
+    X,
+    Y,
+    optimizer_name="adam",
+    epochs=25,
+    batch_size=512,
+    lr=1e-3,
+    verbose=False,
+):
+    idx = np.arange(len(X))
+    np.random.shuffle(idx)
+    X = X[idx]
+    Y = Y[idx]
+
+    n = len(X)
+    n_train = int(0.7 * n)
+    n_val = int(0.15 * n)
+
+    X_train, Y_train = X[:n_train], Y[:n_train]
+    X_val, Y_val = X[n_train:n_train + n_val], Y[n_train:n_train + n_val]
+    X_test, Y_test = X[n_train + n_val:], Y[n_train + n_val:]
+
+    x_scaler = StandardScalerNP().fit(X_train)
+    y_scaler = StandardScalerNP().fit(Y_train)
+
+    X_train_s = x_scaler.transform(X_train)
+    X_val_s = x_scaler.transform(X_val)
+    X_test_s = x_scaler.transform(X_test)
+
+    Y_train_s = y_scaler.transform(Y_train)
+    Y_val_s = y_scaler.transform(Y_val)
+    Y_test_s = y_scaler.transform(Y_test)
+
+    train_ds = ArrayDataset(X_train_s, Y_train_s)
+    val_ds = ArrayDataset(X_val_s, Y_val_s)
+    test_ds = ArrayDataset(X_test_s, Y_test_s)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+
+    model = MLPRegressor(in_dim=X.shape[1]).to(DEVICE)
+    optimizer = get_optimizer(optimizer_name, model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=4
+    )
+    criterion = nn.MSELoss()
+
+    best_state = None
+    best_val = float("inf")
+    history = {"train_loss": [], "val_loss": []}
+    patience = 8
+    bad_epochs = 0
+
+    for epoch in range(epochs):
+        model.train()
+        tr_loss = 0.0
+
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            optimizer.zero_grad()
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            loss.backward()
+            optimizer.step()
+            tr_loss += loss.item() * len(xb)
+
+        tr_loss /= len(train_ds)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                pred = model(xb)
+                loss = criterion(pred, yb)
+                val_loss += loss.item() * len(xb)
+
+        val_loss /= len(val_ds)
+        scheduler.step(val_loss)
+
+        history["train_loss"].append(tr_loss)
+        history["val_loss"].append(val_loss)
+
+        if verbose:
+            print(
+                f"[{optimizer_name}] epoch {epoch+1:03d} "
+                f"train={tr_loss:.6e} val={val_loss:.6e}"
+            )
+
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+
+        if bad_epochs >= patience:
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    model.eval()
+    preds_s = []
+    trues_s = []
+
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb = xb.to(DEVICE)
+            pred = model(xb).cpu().numpy()
+            preds_s.append(pred)
+            trues_s.append(yb.numpy())
+
+    preds_s = np.vstack(preds_s)
+    trues_s = np.vstack(trues_s)
+
+    preds = y_scaler.inverse_transform(preds_s)
+    trues = y_scaler.inverse_transform(trues_s)
+
+    metrics = regression_metrics(trues, preds)
+
+    bundle = {
+        "model": model,
+        "history": history,
+        "metrics": metrics,
+        "x_scaler": x_scaler,
+        "y_scaler": y_scaler,
+        "test_pred": preds,
+        "test_true": trues,
+        "test_input": X_test,
+        "optimizer": optimizer_name,
+    }
+
+    return bundle
+
+
+def optimizer_benchmark(X, Y, epochs=25, batch_size=512, lr=1e-3):
+    optimizers = ["adam", "adamw", "rmsprop", "sgd", "adagrad", "nadam"]
+    results = {}
+
+    for opt in optimizers:
+        results[opt] = train_single_model(
+            X, Y,
+            optimizer_name=opt,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            verbose=False,
+        )
+
+    return results
+
+
+# ============================================================
+# 12) Rollout evaluation of best surrogate on unseen trajectories
+# ============================================================
+def predict_one_step(model_bundle, x_curr, dtau, p, kernel_name, pars_feat):
+    model = model_bundle["model"]
+    model.eval()
+
+    feat = np.concatenate(
+        [x_curr, [dtau, p], kernel_one_hot(kernel_name), pars_feat]
+    ).astype(np.float32)[None, :]
+
+    feat_s = model_bundle["x_scaler"].transform(feat)
+
+    with torch.no_grad():
+        pred_s = model(torch.tensor(feat_s, dtype=torch.float32, device=DEVICE)).cpu().numpy()
+
+    pred = model_bundle["y_scaler"].inverse_transform(pred_s)[0]
+    return np.maximum(pred, 0.0)
+
+
+def rollout_surrogate(model_bundle, T, N, x0, pars, p, kernel_name):
+    t_grid = np.linspace(0.0, T, N + 1)
+    tau_grid = theta_grid(t_grid, p, kernel_name)
+
+    pars_feat = np.array([pars["beta1"], pars["beta2"], pars["gamma"]], dtype=float)
+
+    x = np.zeros((N + 1, len(x0)), dtype=float)
+    x[0] = x0
+
+    for n in range(N):
+        dtau = tau_grid[n + 1] - tau_grid[n]
+        x[n + 1] = predict_one_step(
+            model_bundle, x[n], dtau, p, kernel_name, pars_feat
+        )
+
+    return t_grid, x
+
+
+# ============================================================
+# 13) Plotting and reporting
+# ============================================================
+def plot_kernel_dynamics(trajectories, save_prefix="kernel_compare"):
+    os.makedirs("figures", exist_ok=True)
+
+    for state_idx, state_name in enumerate(STATE_NAMES):
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+        axes = axes.flatten()
+
+        for ax, kernel_name in zip(axes, trajectories.keys()):
+            for p, (t, x) in trajectories[kernel_name].items():
+                ax.plot(t, x[:, state_idx], label=f"p={p}")
+            ax.set_title(kernel_name)
+            ax.set_xlabel("Time")
+            ax.set_ylabel(state_name)
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8)
+
+        plt.tight_layout()
+        plt.savefig(f"figures/{save_prefix}_{state_name}.png", dpi=180)
+        plt.close(fig)
+
+
+def plot_training_histories(benchmark, save_path="figures/optimizer_histories.png"):
+    os.makedirs("figures", exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    for opt, bundle in benchmark.items():
+        axes[0].plot(bundle["history"]["train_loss"], label=opt)
+        axes[1].plot(bundle["history"]["val_loss"], label=opt)
+
+    axes[0].set_title("Training loss")
+    axes[1].set_title("Validation loss")
+
+    for ax in axes:
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("MSE loss")
+        ax.set_yscale("log")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_rollout_comparison(t, x_true, x_pred, kernel_name, p, save_path):
+    os.makedirs("figures", exist_ok=True)
+
+    fig, axes = plt.subplots(3, 2, figsize=(12, 10), sharex=True)
+    axes = axes.flatten()
+
+    for i, name in enumerate(STATE_NAMES):
+        axes[i].plot(t, x_true[:, i], label="Numerical solver", lw=2)
+        axes[i].plot(t, x_pred[:, i], "--", label="DNN surrogate", lw=1.8)
+        axes[i].set_title(f"{name} | kernel={kernel_name}, p={p}")
+        axes[i].grid(True, alpha=0.3)
+        axes[i].legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=180)
+    plt.close(fig)
+
+
+# ============================================================
+# 14) End-to-end experiment runner
+# ============================================================
+def run_all_experiments(output_dir="outputs", quick=False):
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs("figures", exist_ok=True)
+
+    # ---- A. Numerical validation ----
+    val_results = validation_study(
+        T=30.0 if quick else 40.0,
+        p=0.85,
+        kernel_name="shifted_power",
+    )
+
+    # ---- B. Kernel comparison ----
+    p_values = (0.70, 0.85, 0.95) if quick else (0.65, 0.80, 0.95)
+    kernel_summary, trajectories = simulate_kernel_grid(
+        T=40.0 if quick else 60.0,
+        N=600 if quick else 1200,
+        p_values=p_values,
+    )
+    plot_kernel_dynamics(trajectories)
+
+    # ---- C. Surrogate dataset ----
+    X, Y, meta = generate_surrogate_dataset(
+        num_trajectories=18 if quick else 60,
+        T=25.0 if quick else 40.0,
+        N=120 if quick else 250,
+        p_choices=(0.65, 0.75, 0.85, 0.95),
+    )
+
+    # ---- D. Optimizer benchmark ----
+    benchmark = optimizer_benchmark(
+        X, Y,
+        epochs=8 if quick else 25,
+        batch_size=256 if quick else 512,
+        lr=1e-3,
+    )
+    plot_training_histories(benchmark)
+
+    benchmark_table = []
+    for opt, bundle in benchmark.items():
+        row = {"optimizer": opt}
+        row.update(bundle["metrics"])
+        benchmark_table.append(row)
+
+    benchmark_table = sorted(benchmark_table, key=lambda d: d["RMSE"])
+    best_opt = benchmark_table[0]["optimizer"]
+    best_bundle = benchmark[best_opt]
+
+    # ---- E. Rollout on unseen scenarios across kernels ----
+    rollout_summary = []
+    test_kernels = list(KERNELS.keys())
+
+    for kernel_name in test_kernels:
+        p = 0.85
+        pars = sample_random_params(BASE_PARAMS, scale=0.10)
+        x0 = sample_random_x0(BASE_X0, scale=0.15)
+
+        T_roll = 25.0 if quick else 40.0
+        N_roll = 120 if quick else 220
+
+        t_true, _, x_true = gcd_predictor_corrector(T_roll, N_roll, x0, pars, p, kernel_name)
+        t_pred, x_pred = rollout_surrogate(best_bundle, T_roll, N_roll, x0, pars, p, kernel_name)
+
+        metrics = regression_metrics(x_true, x_pred)
+        rollout_summary.append({"kernel": kernel_name, "p": p, **metrics})
+
+        plot_rollout_comparison(
+            t_true, x_true, x_pred, kernel_name, p,
+            save_path=f"figures/rollout_{kernel_name}.png"
+        )
+
+    rollout_rank = sorted(rollout_summary, key=lambda d: d["RMSE"])
+
+    # ---- Save machine-readable outputs ----
+    with open(os.path.join(output_dir, "validation_results.json"), "w") as f:
+        json.dump(val_results, f, indent=2)
+
+    with open(os.path.join(output_dir, "kernel_summary.json"), "w") as f:
+        json.dump(kernel_summary, f, indent=2)
+
+    with open(os.path.join(output_dir, "optimizer_benchmark.json"), "w") as f:
+        json.dump(benchmark_table, f, indent=2)
+
+    with open(os.path.join(output_dir, "rollout_summary.json"), "w") as f:
+        json.dump(rollout_summary, f, indent=2)
+
+    def write_table_txt(path, rows):
+        if not rows:
+            return
+        keys = list(rows[0].keys())
+        with open(path, "w") as f:
+            f.write(",".join(keys) + "\n")
+            for r in rows:
+                f.write(",".join(str(r[k]) for k in keys) + "\n")
+
+    write_table_txt(os.path.join(output_dir, "validation_results.csv"), val_results)
+    write_table_txt(os.path.join(output_dir, "kernel_summary.csv"), kernel_summary)
+    write_table_txt(os.path.join(output_dir, "optimizer_benchmark.csv"), benchmark_table)
+    write_table_txt(os.path.join(output_dir, "rollout_summary.csv"), rollout_summary)
+
+    summary = {
+        "device": DEVICE,
+        "validation_results": val_results,
+        "best_optimizer": best_opt,
+        "optimizer_benchmark": benchmark_table,
+        "rollout_summary": rollout_summary,
+        "best_kernel_by_rollout_rmse": rollout_rank[0]["kernel"] if rollout_rank else None,
+        "best_kernel_metrics": rollout_rank[0] if rollout_rank else None,
+        "num_dataset_samples": int(X.shape[0]),
+        "input_dim": int(X.shape[1]),
+        "output_dim": int(Y.shape[1]),
+        "figures_saved_in": "figures",
+        "tables_saved_in": output_dir,
+    }
+
+    with open(os.path.join(output_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    return summary
+
+
+if __name__ == "__main__":
+    # quick=True for smoke test; quick=False for fuller experiment suite
+    summary = run_all_experiments(output_dir="outputs", quick=False)
+    print("\n=== SUMMARY ===")
+    print(json.dumps(summary, indent=2))
