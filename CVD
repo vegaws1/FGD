@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Publication-grade visualization script for the final heart benchmark.
+
+Reads files from:
+    outputs_heart/
+    outputs_heart/predictions/
+
+Expected files:
+    - statistical_results.json
+    - per_run_metrics.csv
+    - best_params_per_run.csv
+    - runtime_seconds.csv
+    - permutation_importance.csv
+    - pso_feature_frequency.csv
+    - predictions/Stacking_predictions.csv
+    - predictions/TFGD_PSO_predictions.csv
+    - predictions/TFGD_predictions.csv
+    - predictions/ExtraTrees_predictions.csv (optional)
+
+Creates:
+    publication_figures/
+        01_summary_bars_auc_f1.png
+        02_boxplots_auc_f1.png
+        03_runtime_vs_auc.png
+        04_paired_differences_auc_f1.png
+        05_tfgd_hyperparameter_frequency.png
+        06_tfgd_pso_hyperparameter_frequency.png
+        07_confusion_matrices_stacking_vs_tfgd_pso.png
+        08_permutation_importance_clean.png
+        09_pso_feature_frequency_clean.png
+        10_significance_heatmap_auc_f1.png
+"""
+
+import os
+import json
+import ast
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+BASE_DIR = Path("outputs_heart")
+PRED_DIR = BASE_DIR / "predictions"
+OUT_DIR = BASE_DIR / "publication_figures"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+plt.rcParams["figure.dpi"] = 160
+plt.rcParams["savefig.dpi"] = 300
+plt.rcParams["font.size"] = 11
+plt.rcParams["axes.titlesize"] = 13
+plt.rcParams["axes.labelsize"] = 11
+plt.rcParams["legend.fontsize"] = 10
+
+MODELS_ORDER = [
+    "TFGD",
+    "TFGD_PSO",
+    "LogRegEN",
+    "ExtraTrees",
+    "HistGB",
+    "XGBoost",
+    "LightGBM",
+    "Stacking",
+]
+
+TOP_MODELS = ["TFGD", "TFGD_PSO", "ExtraTrees", "Stacking"]
+
+# ---------------------------------------------------------------------
+# Load files
+# ---------------------------------------------------------------------
+def safe_read_json(path):
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def safe_read_csv(path):
+    if not path.exists():
+        return None
+    return pd.read_csv(path)
+
+stats_json = safe_read_json(BASE_DIR / "statistical_results.json")
+per_run = safe_read_csv(BASE_DIR / "per_run_metrics.csv")
+best_params = safe_read_csv(BASE_DIR / "best_params_per_run.csv")
+runtime_df = safe_read_csv(BASE_DIR / "runtime_seconds.csv")
+perm_imp = safe_read_csv(BASE_DIR / "permutation_importance.csv")
+pso_freq = safe_read_csv(BASE_DIR / "pso_feature_frequency.csv")
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def maybe_parse_json_string(x):
+    """
+    Parse stringified dicts in best_params_per_run.csv.
+    Handles CSV-escaped JSON-like strings.
+    """
+    if pd.isna(x):
+        return None
+    if isinstance(x, dict):
+        return x
+    s = str(x).strip()
+
+    # Try json.loads directly
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # Try replacing doubled quotes
+    try:
+        s2 = s.replace('""', '"')
+        return json.loads(s2)
+    except Exception:
+        pass
+
+    # Try literal_eval
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        pass
+
+    try:
+        return ast.literal_eval(s2)
+    except Exception:
+        return None
+
+
+def reorder_existing_models(items, preferred_order):
+    existing = [m for m in preferred_order if m in items]
+    leftovers = [m for m in items if m not in existing]
+    return existing + leftovers
+
+
+def plot_confusion_matrix(ax, y_true, y_pred, title, normalize=True):
+    cm = confusion_matrix(y_true, y_pred)
+    if normalize:
+        cm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt=".2f" if normalize else "d",
+        cmap="Blues",
+        cbar=False,
+        xticklabels=["Pred 0", "Pred 1"],
+        yticklabels=["True 0", "True 1"],
+        ax=ax,
+    )
+    ax.set_title(title)
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+
+
+# ---------------------------------------------------------------------
+# 1) Summary bars (AUC + F1)
+# ---------------------------------------------------------------------
+def make_summary_bars():
+    if stats_json is None:
+        return
+    summary = stats_json["summary_statistics"]
+    models = reorder_existing_models(list(summary.keys()), MODELS_ORDER)
+
+    auc_mean = [summary[m]["auc_mean"] for m in models]
+    auc_std = [summary[m]["auc_std"] for m in models]
+    f1_mean = [summary[m]["f1_mean"] for m in models]
+    f1_std = [summary[m]["f1_std"] for m in models]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    axes[0].bar(models, auc_mean, yerr=auc_std, capsize=4, color="darkorange")
+    axes[0].set_ylabel("AUC")
+    axes[0].set_title("AUC comparison (mean ± std)")
+    axes[0].tick_params(axis="x", rotation=45)
+    axes[0].grid(axis="y", linestyle="--", alpha=0.5)
+
+    axes[1].bar(models, f1_mean, yerr=f1_std, capsize=4, color="steelblue")
+    axes[1].set_ylabel("F1-score")
+    axes[1].set_title("F1-score comparison (mean ± std)")
+    axes[1].tick_params(axis="x", rotation=45)
+    axes[1].grid(axis="y", linestyle="--", alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "01_summary_bars_auc_f1.png")
+    plt.close()
+
+
+# ---------------------------------------------------------------------
+# 2) Boxplots across repetitions
+# ---------------------------------------------------------------------
+def make_boxplots():
+    if per_run is None:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    sns.boxplot(data=per_run, x="model", y="auc", order=MODELS_ORDER, ax=axes[0])
+    axes[0].set_title("AUC across repetitions")
+    axes[0].tick_params(axis="x", rotation=45)
+    axes[0].grid(axis="y", linestyle="--", alpha=0.5)
+
+    sns.boxplot(data=per_run, x="model", y="f1", order=MODELS_ORDER, ax=axes[1])
+    axes[1].set_title("F1-score across repetitions")
+    axes[1].tick_params(axis="x", rotation=45)
+    axes[1].grid(axis="y", linestyle="--", alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "02_boxplots_auc_f1.png")
+    plt.close()
+
+
+# ---------------------------------------------------------------------
+# 3) Runtime vs AUC trade-off
+# ---------------------------------------------------------------------
+def make_runtime_vs_auc():
+    if runtime_df is None or stats_json is None:
+        return
+
+    summary = stats_json["summary_statistics"]
+    runtime_mean = runtime_df.groupby("model")["seconds"].mean().to_dict()
+
+    models = [m for m in MODELS_ORDER if m in summary and m in runtime_mean]
+
+    x = [runtime_mean[m] for m in models]
+    y = [summary[m]["auc_mean"] for m in models]
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(x, y, s=90, color="purple")
+    for i, m in enumerate(models):
+        plt.annotate(m, (x[i], y[i]), fontsize=9, xytext=(4, 4), textcoords="offset points")
+
+    plt.xlabel("Mean runtime per repetition (seconds)")
+    plt.ylabel("Mean AUC")
+    plt.title("Performance–runtime trade-off")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "03_runtime_vs_auc.png")
+    plt.close()
+
+
+# ---------------------------------------------------------------------
+# 4) Paired difference plots
+# ---------------------------------------------------------------------
+def make_paired_difference_plots():
+    if per_run is None:
+        return
+
+    pivot_auc = per_run.pivot(index="repetition", columns="model", values="auc")
+    pivot_f1 = per_run.pivot(index="repetition", columns="model", values="f1")
+
+    required = {"Stacking", "TFGD_PSO", "TFGD"}
+    if not required.issubset(set(pivot_auc.columns)):
+        return
+
+    diff_auc_1 = pivot_auc["Stacking"] - pivot_auc["TFGD_PSO"]
+    diff_auc_2 = pivot_auc["TFGD_PSO"] - pivot_auc["TFGD"]
+
+    diff_f1_1 = pivot_f1["Stacking"] - pivot_f1["TFGD_PSO"]
+    diff_f1_2 = pivot_f1["TFGD_PSO"] - pivot_f1["TFGD"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+
+    axes[0, 0].axhline(0, color="black", linestyle="--")
+    axes[0, 0].plot(diff_auc_1.index, diff_auc_1.values, marker="o")
+    axes[0, 0].set_title("AUC difference: Stacking - TFGD_PSO")
+    axes[0, 0].set_ylabel("Difference")
+
+    axes[0, 1].axhline(0, color="black", linestyle="--")
+    axes[0, 1].plot(diff_auc_2.index, diff_auc_2.values, marker="o", color="darkorange")
+    axes[0, 1].set_title("AUC difference: TFGD_PSO - TFGD")
+
+    axes[1, 0].axhline(0, color="black", linestyle="--")
+    axes[1, 0].plot(diff_f1_1.index, diff_f1_1.values, marker="o", color="green")
+    axes[1, 0].set_title("F1 difference: Stacking - TFGD_PSO")
+    axes[1, 0].set_xlabel("Repetition")
+    axes[1, 0].set_ylabel("Difference")
+
+    axes[1, 1].axhline(0, color="black", linestyle="--")
+    axes[1, 1].plot(diff_f1_2.index, diff_f1_2.values, marker="o", color="red")
+    axes[1, 1].set_title("F1 difference: TFGD_PSO - TFGD")
+    axes[1, 1].set_xlabel("Repetition")
+
+    for ax in axes.ravel():
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "04_paired_differences_auc_f1.png")
+    plt.close()
+
+
+# ---------------------------------------------------------------------
+# 5) Hyperparameter frequency heatmaps
+# ---------------------------------------------------------------------
+def make_hyperparam_heatmaps():
+    if best_params is None:
+        return
+
+    df = best_params.copy()
+    df["parsed"] = df["best_params"].apply(maybe_parse_json_string)
+
+    # ---------------- TFGD ----------------
+    tfgd = df[df["model"] == "TFGD"].copy()
+    if not tfgd.empty:
+        tfgd["alpha"] = tfgd["parsed"].apply(lambda d: d.get("alpha") if isinstance(d, dict) else np.nan)
+        tfgd["lam"] = tfgd["parsed"].apply(lambda d: d.get("lam") if isinstance(d, dict) else np.nan)
+        table = pd.crosstab(tfgd["alpha"], tfgd["lam"])
+
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(table, annot=True, fmt="d", cmap="Blues")
+        plt.title("TFGD hyperparameter selection frequency")
+        plt.xlabel(r"$\lambda$")
+        plt.ylabel(r"$\alpha$")
+        plt.tight_layout()
+        plt.savefig(OUT_DIR / "05_tfgd_hyperparameter_frequency.png")
+        plt.close()
+
+    # ---------------- TFGD_PSO ----------------
+    tfgd_pso = df[df["model"] == "TFGD_PSO"].copy()
+    if not tfgd_pso.empty:
+        tfgd_pso["alpha"] = tfgd_pso["parsed"].apply(lambda d: d.get("alpha") if isinstance(d, dict) else np.nan)
+        tfgd_pso["lam"] = tfgd_pso["parsed"].apply(lambda d: d.get("lam") if isinstance(d, dict) else np.nan)
+        table = pd.crosstab(tfgd_pso["alpha"], tfgd_pso["lam"])
+
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(table, annot=True, fmt="d", cmap="Oranges")
+        plt.title("TFGD_PSO hyperparameter selection frequency")
+        plt.xlabel(r"$\lambda$")
+        plt.ylabel(r"$\alpha$")
+        plt.tight_layout()
+        plt.savefig(OUT_DIR / "06_tfgd_pso_hyperparameter_frequency.png")
+        plt.close()
+
+
+# ---------------------------------------------------------------------
+# 6) Confusion matrices for best overall vs best proposed
+# ---------------------------------------------------------------------
+def make_confusion_matrices():
+    stack_file = PRED_DIR / "Stacking_predictions.csv"
+    pso_file = PRED_DIR / "TFGD_PSO_predictions.csv"
+
+    if not (stack_file.exists() and pso_file.exists()):
+        return
+
+    df_stack = pd.read_csv(stack_file)
+    df_pso = pd.read_csv(pso_file)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+    plot_confusion_matrix(
+        axes[0],
+        df_stack["true_label"].values,
+        df_stack["predicted_label"].values,
+        title="Stacking (normalized confusion matrix)",
+        normalize=True
+    )
+    plot_confusion_matrix(
+        axes[1],
+        df_pso["true_label"].values,
+        df_pso["predicted_label"].values,
+        title="TFGD_PSO (normalized confusion matrix)",
+        normalize=True
+    )
+
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "07_confusion_matrices_stacking_vs_tfgd_pso.png")
+    plt.close()
+
+
+# ---------------------------------------------------------------------
+# 7) Clean permutation importance plot
+# ---------------------------------------------------------------------
+def make_permutation_importance_clean():
+    if perm_imp is None or perm_imp.empty:
+        return
+
+    df = perm_imp.copy().sort_values("Importance", ascending=True)
+
+    plt.figure(figsize=(9, 6))
+    plt.barh(df["Feature"], df["Importance"], color="teal")
+    plt.xlabel("Permutation importance")
+    plt.ylabel("Feature")
+    plt.title("Top permutation importances (best classical model)")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "08_permutation_importance_clean.png")
+    plt.close()
+
+
+# ---------------------------------------------------------------------
+# 8) Clean PSO feature frequency plot
+# ---------------------------------------------------------------------
+def make_pso_frequency_clean():
+    if pso_freq is None or pso_freq.empty:
+        return
+
+    df = pso_freq.copy().sort_values("Count", ascending=True)
+
+    plt.figure(figsize=(10, 6))
+    plt.barh(df["Feature"], df["Count"], color="slateblue")
+    plt.xlabel("Count")
+    plt.ylabel("Constructed feature")
+    plt.title("Most frequent PSO-constructed features across repetitions")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "09_pso_feature_frequency_clean.png")
+    plt.close()
+
+
+# ---------------------------------------------------------------------
+# 9) Significance heatmap (AUC / F1 p-values)
+# ---------------------------------------------------------------------
+def make_significance_heatmap():
+    if stats_json is None:
+        return
+
+    paired = stats_json.get("paired_tests", {})
+    if not paired:
+        return
+
+    rows = []
+    for k, v in paired.items():
+        rows.append({
+            "comparison": k,
+            "auc_holm_p": v["auc"]["holm_bonferroni_p_value"],
+            "f1_holm_p": v["f1"]["holm_bonferroni_p_value"],
+        })
+    df = pd.DataFrame(rows).set_index("comparison")
+
+    plt.figure(figsize=(8, max(4, 0.6 * len(df))))
+    sns.heatmap(df, annot=True, fmt=".3f", cmap="magma_r", cbar=True)
+    plt.title("Holm-corrected p-values vs. best model")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "10_significance_heatmap_auc_f1.png")
+    plt.close()
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+def main():
+    print("Generating publication-grade figures...")
+
+    make_summary_bars()
+    make_boxplots()
+    make_runtime_vs_auc()
+    make_paired_difference_plots()
+    make_hyperparam_heatmaps()
+    make_confusion_matrices()
+    make_permutation_importance_clean()
+    make_pso_frequency_clean()
+    make_significance_heatmap()
+
+    print(f"Done. Figures saved to: {OUT_DIR.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
