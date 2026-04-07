@@ -1,0 +1,1064 @@
+import os
+import time
+import math
+import copy
+import json
+import random
+import argparse
+from collections import deque
+from typing import Dict, List, Any
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader
+from torchvision import transforms
+
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+
+import medmnist
+from medmnist import INFO
+
+
+# =========================================================
+# Reproducibility
+# =========================================================
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# =========================================================
+# Model
+# =========================================================
+class TinyCNN(nn.Module):
+    """
+    Lightweight CNN for MedMNIST 2D subsets.
+    """
+
+    def __init__(self, in_channels: int, out_dim: int, dropout: float = 0.2):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 28 -> 14
+
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 14 -> 7
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(64, out_dim),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+
+# =========================================================
+# Proximal helpers
+# =========================================================
+def soft_threshold_(tensor: torch.Tensor, thresh: float):
+    with torch.no_grad():
+        tensor.copy_(torch.sign(tensor) * torch.clamp(torch.abs(tensor) - thresh, min=0.0))
+
+
+def should_apply_prox(param: torch.Tensor, prox_on_bias: bool = False) -> bool:
+    if prox_on_bias:
+        return True
+    # exclude bias and BN parameters by default
+    return param.ndim > 1
+
+
+# =========================================================
+# Tempered weights
+# =========================================================
+def tempered_weights(alpha: float, lam: float, M: int, device: torch.device):
+    weights = torch.zeros(M + 1, dtype=torch.float32, device=device)
+    weights[0] = 1.0
+    decay = math.exp(-lam)
+    for j in range(1, M + 1):
+        weights[j] = decay * ((j + alpha - 1.0) / j) * weights[j - 1]
+    return weights
+
+
+# =========================================================
+# Optimizers
+# =========================================================
+class ProxSGD(Optimizer):
+    """SGD + proximal L1 step with support for parameter groups."""
+
+    def __init__(self, params, lr=1e-2, weight_decay=0.0, momentum=0.0):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            wd = group.get('weight_decay', 0.0)
+            prox_mu = group.get('prox_mu', 0.0)
+            prox_on_bias = group.get('prox_on_bias', False)
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.detach()
+                if wd > 0:
+                    grad = grad + wd * p.data
+                p.data.add_(grad, alpha=-lr)
+
+                if prox_mu > 0 and should_apply_prox(p, prox_on_bias=prox_on_bias):
+                    soft_threshold_(p.data, lr * prox_mu)
+        return loss
+
+
+class TFGD(Optimizer):
+    """Tempered Fractional Gradient Descent with truncated memory."""
+
+    def __init__(self, params, lr=1e-3, alpha=0.6, lam=0.5, M=20, weight_decay=0.0):
+        defaults = dict(lr=lr, alpha=alpha, lam=lam, M=M, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+        self._weights_cache = {}
+
+    def _get_weights(self, device, alpha, lam, M):
+        key = (str(device), round(alpha, 8), round(lam, 8), int(M))
+        if key not in self._weights_cache:
+            self._weights_cache[key] = tempered_weights(alpha, lam, M, device=device)
+        return self._weights_cache[key]
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            alpha = group.get('alpha', 0.6)
+            lam = group.get('lam', 0.5)
+            M = group.get('M', 20)
+            wd = group.get('weight_decay', 0.0)
+
+            device = None
+            for p in group['params']:
+                if p.requires_grad:
+                    device = p.device
+                    break
+            if device is None:
+                continue
+
+            weights = self._get_weights(device, alpha, lam, M)
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.detach().clone()
+                if wd > 0:
+                    grad = grad + wd * p.data
+
+                state = self.state[p]
+                if 'hist' not in state:
+                    state['hist'] = deque(maxlen=M + 1)
+                hist = state['hist']
+                hist.appendleft(grad)
+
+                mem = torch.zeros_like(p.data)
+                m = min(len(hist), M + 1)
+                for j in range(m):
+                    mem.add_(hist[j], alpha=float(weights[j]))
+
+                p.data.add_(mem, alpha=-lr)
+        return loss
+
+
+class TFGDProx(Optimizer):
+    """Tempered Fractional Gradient Descent + proximal L1 step, with group-specific prox_mu and M."""
+
+    def __init__(self, params, lr=1e-3, alpha=0.6, lam=0.5, M=20, weight_decay=0.0):
+        defaults = dict(lr=lr, alpha=alpha, lam=lam, M=M, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+        self._weights_cache = {}
+
+    def _get_weights(self, device, alpha, lam, M):
+        key = (str(device), round(alpha, 8), round(lam, 8), int(M))
+        if key not in self._weights_cache:
+            self._weights_cache[key] = tempered_weights(alpha, lam, M, device=device)
+        return self._weights_cache[key]
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            alpha = group.get('alpha', 0.6)
+            lam = group.get('lam', 0.5)
+            M = group.get('M', 20)
+            wd = group.get('weight_decay', 0.0)
+            prox_mu = group.get('prox_mu', 0.0)
+            prox_on_bias = group.get('prox_on_bias', False)
+
+            device = None
+            for p in group['params']:
+                if p.requires_grad:
+                    device = p.device
+                    break
+            if device is None:
+                continue
+
+            weights = self._get_weights(device, alpha, lam, M)
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.detach().clone()
+                if wd > 0:
+                    grad = grad + wd * p.data
+
+                state = self.state[p]
+                if 'hist' not in state:
+                    state['hist'] = deque(maxlen=M + 1)
+                hist = state['hist']
+                hist.appendleft(grad)
+
+                mem = torch.zeros_like(p.data)
+                m = min(len(hist), M + 1)
+                for j in range(m):
+                    mem.add_(hist[j], alpha=float(weights[j]))
+
+                # gradient step
+                p.data.add_(mem, alpha=-lr)
+
+                # proximal step
+                if prox_mu > 0 and should_apply_prox(p, prox_on_bias=prox_on_bias):
+                    soft_threshold_(p.data, lr * prox_mu)
+        return loss
+
+
+# =========================================================
+# MedMNIST loading
+# =========================================================
+def get_medmnist_dataloaders(data_flag: str, batch_size: int = 64, size: int = 28, num_workers: int = 0):
+    info = INFO[data_flag]
+    DataClass = getattr(medmnist, info['python_class'])
+    task = info['task']
+    n_channels = info['n_channels']
+    n_classes = len(info['label'])
+
+    transform = transforms.Compose([transforms.ToTensor()])
+
+    train_dataset = DataClass(split='train', transform=transform, download=True, size=size)
+    val_dataset = DataClass(split='val', transform=transform, download=True, size=size)
+    test_dataset = DataClass(split='test', transform=transform, download=True, size=size)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    return train_loader, val_loader, test_loader, info, task, n_channels, n_classes
+
+
+# =========================================================
+# Task helpers
+# =========================================================
+def get_output_dim_and_loss(task: str, n_classes: int):
+    if task == 'binary-class':
+        return 1, nn.BCEWithLogitsLoss()
+    elif task == 'multi-class':
+        return n_classes, nn.CrossEntropyLoss()
+    elif task == 'multi-label, binary-class':
+        return n_classes, nn.BCEWithLogitsLoss()
+    else:
+        raise ValueError(f'Unsupported task type: {task}')
+
+
+def prepare_targets(y, task: str, device: torch.device):
+    y = y.to(device)
+    if task == 'binary-class':
+        y = y.float().view(-1, 1)
+    elif task == 'multi-class':
+        y = y.long().view(-1)
+    elif task == 'multi-label, binary-class':
+        y = y.float()
+    return y
+
+
+def logits_to_predictions(logits: torch.Tensor, task: str):
+    if task == 'binary-class':
+        probs = torch.sigmoid(logits)
+        preds = (probs >= 0.5).long()
+        return probs.detach().cpu().numpy(), preds.detach().cpu().numpy()
+
+    elif task == 'multi-class':
+        probs = torch.softmax(logits, dim=1)
+        preds = torch.argmax(probs, dim=1)
+        return probs.detach().cpu().numpy(), preds.detach().cpu().numpy()
+
+    elif task == 'multi-label, binary-class':
+        probs = torch.sigmoid(logits)
+        preds = (probs >= 0.5).long()
+        return probs.detach().cpu().numpy(), preds.detach().cpu().numpy()
+
+    else:
+        raise ValueError(f'Unsupported task type: {task}')
+
+
+def compute_metrics(y_true, y_prob, y_pred, task: str, n_classes: int) -> Dict[str, float]:
+    metrics = {}
+
+    if task == 'binary-class':
+        y_true = y_true.reshape(-1)
+        y_prob = y_prob.reshape(-1)
+        y_pred = y_pred.reshape(-1)
+
+        metrics['acc'] = accuracy_score(y_true, y_pred)
+        metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro')
+        try:
+            metrics['auc'] = roc_auc_score(y_true, y_prob)
+        except Exception:
+            metrics['auc'] = np.nan
+
+    elif task == 'multi-class':
+        y_true = y_true.reshape(-1)
+        y_pred = y_pred.reshape(-1)
+
+        metrics['acc'] = accuracy_score(y_true, y_pred)
+        metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro')
+        try:
+            y_true_onehot = np.eye(n_classes)[y_true]
+            metrics['auc'] = roc_auc_score(y_true_onehot, y_prob, multi_class='ovr', average='macro')
+        except Exception:
+            metrics['auc'] = np.nan
+
+    elif task == 'multi-label, binary-class':
+        metrics['acc'] = float((y_true == y_pred).mean())
+        try:
+            metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        except Exception:
+            metrics['f1_macro'] = np.nan
+        try:
+            metrics['auc'] = roc_auc_score(y_true, y_prob, average='macro')
+        except Exception:
+            metrics['auc'] = np.nan
+
+    return metrics
+
+
+# =========================================================
+# Training / evaluation
+# =========================================================
+def train_one_epoch(model, loader, optimizer, criterion, device, task):
+    model.train()
+    running_loss = 0.0
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = prepare_targets(y, task, device)
+
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * x.size(0)
+
+    return running_loss / len(loader.dataset)
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, task, n_classes):
+    model.eval()
+    running_loss = 0.0
+    all_true, all_prob, all_pred = [], [], []
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y_dev = prepare_targets(y, task, device)
+
+        logits = model(x)
+        loss = criterion(logits, y_dev)
+        running_loss += loss.item() * x.size(0)
+
+        probs, preds = logits_to_predictions(logits, task)
+        all_true.append(y.numpy())
+        all_prob.append(probs)
+        all_pred.append(preds)
+
+    epoch_loss = running_loss / len(loader.dataset)
+    y_true = np.concatenate(all_true, axis=0)
+    y_prob = np.concatenate(all_prob, axis=0)
+    y_pred = np.concatenate(all_pred, axis=0)
+
+    metrics = compute_metrics(y_true, y_prob, y_pred, task, n_classes)
+    metrics['loss'] = epoch_loss
+    return metrics
+
+
+# =========================================================
+# Sparsity / size / latency
+# =========================================================
+def model_sparsity_thresholds(model: nn.Module, thresholds=(1e-8, 1e-5, 1e-4), include_bias=False):
+    params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if (not include_bias) and p.ndim == 1:
+            continue
+        params.append(p.detach().cpu().abs().view(-1))
+
+    if len(params) == 0:
+        return {'counted_params': 0}
+
+    flat = torch.cat(params)
+    out = {'counted_params': int(flat.numel())}
+    for th in thresholds:
+        count = int((flat <= th).sum().item())
+        out[f'count_le_{th:.0e}'] = count
+        out[f'sparsity_le_{th:.0e}'] = count / max(int(flat.numel()), 1)
+    return out
+
+
+def model_size_mb(model: nn.Module):
+    total_bytes = 0
+    for p in model.parameters():
+        total_bytes += p.numel() * p.element_size()
+    return total_bytes / (1024 ** 2)
+
+
+@torch.no_grad()
+def benchmark_latency(model, sample_shape, device, repeats=100, warmup=20):
+    model.eval()
+    x = torch.randn(sample_shape, device=device)
+
+    for _ in range(warmup):
+        _ = model(x)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+
+    times = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        _ = model(x)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        times.append((t1 - t0) * 1000.0)
+
+    return {
+        'latency_ms_mean': float(np.mean(times)),
+        'latency_ms_std': float(np.std(times)),
+    }
+
+
+# =========================================================
+# Parameter grouping
+# =========================================================
+def build_param_groups(model: nn.Module,
+                       optimizer_name: str,
+                       lr: float,
+                       alpha: float,
+                       lam: float,
+                       M: int,
+                       weight_decay: float,
+                       prox_mu: float,
+                       layer_specific_prox: bool,
+                       prox_mu_feature: float,
+                       prox_mu_classifier: float,
+                       M_feature: int,
+                       M_classifier: int,
+                       prox_on_bias: bool = False):
+    optimizer_name = optimizer_name.lower()
+
+    if optimizer_name not in {'proxsgd', 'tfgd', 'tfgdprox'}:
+        return model.parameters()
+
+    if not layer_specific_prox:
+        group = {
+            'params': list(model.parameters()),
+            'lr': lr,
+            'alpha': alpha,
+            'lam': lam,
+            'M': M,
+            'weight_decay': weight_decay,
+            'prox_mu': prox_mu if optimizer_name in {'proxsgd', 'tfgdprox'} else 0.0,
+            'prox_on_bias': prox_on_bias,
+        }
+        return [group]
+
+    feature_params = []
+    classifier_params = []
+    for name, p in model.named_parameters():
+        if name.startswith('features'):
+            feature_params.append(p)
+        elif name.startswith('classifier'):
+            classifier_params.append(p)
+        else:
+            classifier_params.append(p)
+
+    groups = [
+        {
+            'params': feature_params,
+            'lr': lr,
+            'alpha': alpha,
+            'lam': lam,
+            'M': M_feature,
+            'weight_decay': weight_decay,
+            'prox_mu': prox_mu_feature if optimizer_name in {'proxsgd', 'tfgdprox'} else 0.0,
+            'prox_on_bias': prox_on_bias,
+        },
+        {
+            'params': classifier_params,
+            'lr': lr,
+            'alpha': alpha,
+            'lam': lam,
+            'M': M_classifier,
+            'weight_decay': weight_decay,
+            'prox_mu': prox_mu_classifier if optimizer_name in {'proxsgd', 'tfgdprox'} else 0.0,
+            'prox_on_bias': prox_on_bias,
+        }
+    ]
+    return groups
+
+
+# =========================================================
+# Optimizer factory
+# =========================================================
+def make_optimizer(name: str, model: nn.Module, cfg: dict):
+    name = name.lower()
+    params_or_groups = build_param_groups(
+        model=model,
+        optimizer_name=name,
+        lr=cfg['lr'],
+        alpha=cfg.get('alpha', 0.6),
+        lam=cfg.get('lam', 0.5),
+        M=cfg.get('M', 20),
+        weight_decay=cfg.get('weight_decay', 0.0),
+        prox_mu=cfg.get('prox_mu', 0.0),
+        layer_specific_prox=cfg.get('layer_specific_prox', False),
+        prox_mu_feature=cfg.get('prox_mu_feature', 0.0),
+        prox_mu_classifier=cfg.get('prox_mu_classifier', 0.0),
+        M_feature=cfg.get('M_feature', cfg.get('M', 20)),
+        M_classifier=cfg.get('M_classifier', cfg.get('M', 20)),
+        prox_on_bias=cfg.get('prox_on_bias', False),
+    )
+
+    if name == 'sgd':
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=cfg['lr'],
+            momentum=cfg.get('momentum', 0.0),
+            weight_decay=cfg.get('weight_decay', 0.0),
+        )
+
+    elif name == 'adam':
+        return torch.optim.Adam(
+            model.parameters(),
+            lr=cfg['lr'],
+            weight_decay=cfg.get('weight_decay', 0.0),
+        )
+
+    elif name == 'proxsgd':
+        return ProxSGD(
+            params_or_groups,
+            lr=cfg['lr'],
+            weight_decay=cfg.get('weight_decay', 0.0),
+            momentum=cfg.get('momentum', 0.0),
+        )
+
+    elif name == 'tfgd':
+        return TFGD(
+            params_or_groups,
+            lr=cfg['lr'],
+            alpha=cfg.get('alpha', 0.6),
+            lam=cfg.get('lam', 0.5),
+            M=cfg.get('M', 20),
+            weight_decay=cfg.get('weight_decay', 0.0),
+        )
+
+    elif name == 'tfgdprox':
+        return TFGDProx(
+            params_or_groups,
+            lr=cfg['lr'],
+            alpha=cfg.get('alpha', 0.6),
+            lam=cfg.get('lam', 0.5),
+            M=cfg.get('M', 20),
+            weight_decay=cfg.get('weight_decay', 0.0),
+        )
+
+    else:
+        raise ValueError(f'Unknown optimizer name: {name}')
+
+
+# =========================================================
+# Plotting
+# =========================================================
+def plot_training_curves(hist_df: pd.DataFrame, save_path: str, title: str = None):
+    fig, axes = plt.subplots(1, 4, figsize=(19, 4))
+
+    axes[0].plot(hist_df['epoch'], hist_df['train_loss'], label='Train Loss')
+    axes[0].plot(hist_df['epoch'], hist_df['val_loss'], label='Val Loss')
+    axes[0].set_title('Loss')
+    axes[0].set_xlabel('Epoch')
+    axes[0].legend()
+
+    axes[1].plot(hist_df['epoch'], hist_df['val_acc'], label='Val ACC')
+    axes[1].plot(hist_df['epoch'], hist_df['val_f1_macro'], label='Val F1')
+    axes[1].set_title('Validation ACC / F1')
+    axes[1].set_xlabel('Epoch')
+    axes[1].legend()
+
+    axes[2].plot(hist_df['epoch'], hist_df['val_auc'], label='Val AUC')
+    axes[2].set_title('Validation AUC')
+    axes[2].set_xlabel('Epoch')
+    axes[2].legend()
+
+    if 'sparsity_le_1e-08' in hist_df.columns:
+        axes[3].plot(hist_df['epoch'], hist_df['sparsity_le_1e-08'] * 100.0, label='<=1e-8')
+        axes[3].plot(hist_df['epoch'], hist_df['sparsity_le_1e-05'] * 100.0, label='<=1e-5')
+        axes[3].plot(hist_df['epoch'], hist_df['sparsity_le_1e-04'] * 100.0, label='<=1e-4')
+        axes[3].set_title('Near-zero sparsity')
+        axes[3].set_xlabel('Epoch')
+        axes[3].set_ylabel('Sparsity (%)')
+        axes[3].legend()
+    else:
+        axes[3].axis('off')
+
+    if title:
+        fig.suptitle(title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+
+# =========================================================
+# JSON helper
+# =========================================================
+def to_serializable(x: Any):
+    if isinstance(x, (np.floating, np.float32, np.float64)):
+        return float(x)
+    if isinstance(x, (np.integer, np.int32, np.int64)):
+        return int(x)
+    if isinstance(x, dict):
+        return {k: to_serializable(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [to_serializable(v) for v in x]
+    return x
+
+
+# =========================================================
+# Single experiment
+# =========================================================
+def run_experiment(
+    data_flag: str = 'pathmnist',
+    optimizer_name: str = 'tfgdprox',
+    epochs: int = 20,
+    batch_size: int = 64,
+    size: int = 28,
+    lr: float = 1e-3,
+    alpha: float = 0.6,
+    lam: float = 0.5,
+    M: int = 20,
+    prox_mu: float = 1e-5,
+    prox_mu_feature: float = 0.0,
+    prox_mu_classifier: float = 0.0,
+    layer_specific_prox: bool = False,
+    M_feature: int = 20,
+    M_classifier: int = 20,
+    weight_decay: float = 0.0,
+    momentum: float = 0.9,
+    seed: int = 42,
+    device_str: str = 'auto',
+    early_stop_patience: int = 5,
+    output_dir: str = 'outputs_v2',
+    sparsity_thresholds=(1e-8, 1e-5, 1e-4),
+    save_model: bool = True,
+    save_plot: bool = True,
+):
+    set_seed(seed)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if device_str == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(device_str)
+
+    train_loader, val_loader, test_loader, info, task, n_channels, n_classes = get_medmnist_dataloaders(
+        data_flag=data_flag,
+        batch_size=batch_size,
+        size=size,
+        num_workers=0,
+    )
+
+    out_dim, criterion = get_output_dim_and_loss(task, n_classes)
+    model = TinyCNN(in_channels=n_channels, out_dim=out_dim).to(device)
+
+    opt_cfg = {
+        'lr': lr,
+        'alpha': alpha,
+        'lam': lam,
+        'M': M,
+        'prox_mu': prox_mu,
+        'prox_mu_feature': prox_mu_feature,
+        'prox_mu_classifier': prox_mu_classifier,
+        'layer_specific_prox': layer_specific_prox,
+        'M_feature': M_feature,
+        'M_classifier': M_classifier,
+        'weight_decay': weight_decay,
+        'momentum': momentum,
+        'prox_on_bias': False,
+    }
+
+    optimizer = make_optimizer(optimizer_name, model, opt_cfg)
+
+    history = []
+    best_model = None
+    best_val_auc = -np.inf
+    best_epoch = -1
+    patience_counter = 0
+
+    print(f"\\n=== Running {optimizer_name.upper()} on {data_flag} | seed={seed} ===")
+    print(f"Task: {task}, Channels: {n_channels}, Classes: {n_classes}, Device: {device}")
+
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, task)
+        val_metrics = evaluate(model, val_loader, criterion, device, task, n_classes)
+        sparsity = model_sparsity_thresholds(model, thresholds=sparsity_thresholds, include_bias=False)
+
+        row = {
+            'epoch': epoch,
+            'train_loss': float(train_loss),
+            'val_loss': float(val_metrics['loss']),
+            'val_acc': float(val_metrics.get('acc', np.nan)),
+            'val_f1_macro': float(val_metrics.get('f1_macro', np.nan)),
+            'val_auc': float(val_metrics.get('auc', np.nan)),
+        }
+        for th in sparsity_thresholds:
+            key = f'sparsity_le_{th:.0e}'
+            row[key] = float(sparsity[key])
+        history.append(row)
+
+        print(
+            f"Epoch {epoch:03d} | "
+            f"train_loss={row['train_loss']:.4f} | "
+            f"val_loss={row['val_loss']:.4f} | "
+            f"val_acc={row['val_acc']:.4f} | "
+            f"val_f1={row['val_f1_macro']:.4f} | "
+            f"val_auc={row['val_auc']:.4f} | "
+            f"sp<=1e-8={row.get('sparsity_le_1e-08', np.nan):.4f}"
+        )
+
+        current_val_auc = row['val_auc'] if not np.isnan(row['val_auc']) else -np.inf
+        if current_val_auc > best_val_auc:
+            best_val_auc = current_val_auc
+            best_epoch = epoch
+            best_model = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= early_stop_patience:
+            print(f"Early stopping at epoch {epoch}. Best epoch was {best_epoch}.")
+            break
+
+    if best_model is not None:
+        model.load_state_dict(best_model)
+
+    test_metrics = evaluate(model, test_loader, criterion, device, task, n_classes)
+    sparsity = model_sparsity_thresholds(model, thresholds=sparsity_thresholds, include_bias=False)
+    size_mb = model_size_mb(model)
+
+    # CPU latency for edge-oriented benchmarking
+    model_cpu = copy.deepcopy(model).to(torch.device('cpu'))
+    latency = benchmark_latency(
+        model_cpu,
+        sample_shape=(1, n_channels, size, size),
+        device=torch.device('cpu'),
+        repeats=100,
+        warmup=20,
+    )
+
+    final_results = {
+        'dataset': data_flag,
+        'optimizer': optimizer_name,
+        'task': task,
+        'seed': seed,
+        'best_val_auc': float(best_val_auc),
+        'best_epoch': int(best_epoch),
+        'test_loss': float(test_metrics.get('loss', np.nan)),
+        'test_acc': float(test_metrics.get('acc', np.nan)),
+        'test_f1_macro': float(test_metrics.get('f1_macro', np.nan)),
+        'test_auc': float(test_metrics.get('auc', np.nan)),
+        'counted_params': int(sparsity['counted_params']),
+        'model_size_mb': float(size_mb),
+        'latency_ms_mean_cpu': float(latency['latency_ms_mean']),
+        'latency_ms_std_cpu': float(latency['latency_ms_std']),
+        'config': to_serializable(opt_cfg),
+    }
+    for th in sparsity_thresholds:
+        final_results[f'count_le_{th:.0e}'] = int(sparsity[f'count_le_{th:.0e}'])
+        final_results[f'sparsity_le_{th:.0e}'] = float(sparsity[f'sparsity_le_{th:.0e}'])
+
+    print("\\n=== Final Test Metrics ===")
+    for k, v in final_results.items():
+        if isinstance(v, float):
+            print(f"{k}: {v:.6f}")
+        else:
+            print(f"{k}: {v}")
+
+    # Save artifacts
+    run_tag = f"{data_flag}_{optimizer_name}_seed{seed}"
+    if optimizer_name.lower() in {'proxsgd', 'tfgdprox'}:
+        if layer_specific_prox:
+            run_tag += f"_muF{prox_mu_feature}_muC{prox_mu_classifier}"
+        else:
+            run_tag += f"_mu{prox_mu}"
+
+    hist_df = pd.DataFrame(history)
+    hist_path = os.path.join(output_dir, f"{run_tag}_history.csv")
+    hist_df.to_csv(hist_path, index=False)
+
+    results_path = os.path.join(output_dir, f"{run_tag}_results.json")
+    with open(results_path, 'w') as f:
+        json.dump(to_serializable(final_results), f, indent=2)
+
+    if save_model:
+        model_path = os.path.join(output_dir, f"{run_tag}_best_model.pt")
+        torch.save(model.state_dict(), model_path)
+
+    if save_plot:
+        plot_path = os.path.join(output_dir, f"{run_tag}_curves.png")
+        plot_training_curves(hist_df, plot_path, title=run_tag)
+
+    return final_results, hist_df
+
+
+# =========================================================
+# Aggregation helpers
+# =========================================================
+def aggregate_runs(df: pd.DataFrame, metric_cols: List[str]):
+    group_cols = [c for c in df.columns if c not in metric_cols and c not in {'seed', 'best_epoch'}]
+    agg = df.groupby(group_cols, dropna=False)[metric_cols].agg(['mean', 'std']).reset_index()
+    agg.columns = ['_'.join([str(x) for x in col if x != '']).rstrip('_') for col in agg.columns.values]
+    return agg
+
+
+# =========================================================
+# Grid benchmark
+# =========================================================
+def run_grid_benchmark(
+    datasets: List[str],
+    optimizers: List[str],
+    seeds: List[int],
+    prox_mu_values: List[float],
+    epochs: int = 20,
+    batch_size: int = 64,
+    size: int = 28,
+    lr: float = 1e-3,
+    alpha: float = 0.6,
+    lam: float = 0.5,
+    M: int = 20,
+    weight_decay: float = 0.0,
+    momentum: float = 0.9,
+    device_str: str = 'auto',
+    patience: int = 5,
+    output_dir: str = 'outputs_v2',
+    layer_specific_prox: bool = True,
+    prox_mu_feature_scale: float = 0.1,
+    M_feature: int = 20,
+    M_classifier: int = 20,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    all_results = []
+
+    for data_flag in datasets:
+        for opt_name in optimizers:
+            if opt_name.lower() in {'proxsgd', 'tfgdprox'}:
+                mu_grid = prox_mu_values
+            else:
+                mu_grid = [0.0]
+
+            for prox_mu in mu_grid:
+                for seed in seeds:
+                    prox_mu_feature = prox_mu * prox_mu_feature_scale if layer_specific_prox else prox_mu
+                    prox_mu_classifier = prox_mu if layer_specific_prox else prox_mu
+
+                    results, _ = run_experiment(
+                        data_flag=data_flag,
+                        optimizer_name=opt_name,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        size=size,
+                        lr=lr,
+                        alpha=alpha,
+                        lam=lam,
+                        M=M,
+                        prox_mu=prox_mu,
+                        prox_mu_feature=prox_mu_feature,
+                        prox_mu_classifier=prox_mu_classifier,
+                        layer_specific_prox=layer_specific_prox if opt_name.lower() in {'proxsgd', 'tfgdprox'} else False,
+                        M_feature=M_feature,
+                        M_classifier=M_classifier,
+                        weight_decay=weight_decay,
+                        momentum=momentum,
+                        seed=seed,
+                        device_str=device_str,
+                        early_stop_patience=patience,
+                        output_dir=output_dir,
+                    )
+                    all_results.append(results)
+
+    raw_df = pd.DataFrame(all_results)
+    raw_path = os.path.join(output_dir, 'benchmark_raw_results.csv')
+    raw_df.to_csv(raw_path, index=False)
+
+    metric_cols = [
+        'best_val_auc', 'test_loss', 'test_acc', 'test_f1_macro', 'test_auc',
+        'model_size_mb', 'latency_ms_mean_cpu', 'latency_ms_std_cpu',
+        'sparsity_le_1e-08', 'sparsity_le_1e-05', 'sparsity_le_1e-04'
+    ]
+    metric_cols = [c for c in metric_cols if c in raw_df.columns]
+
+    summary_df = aggregate_runs(raw_df, metric_cols=metric_cols)
+    summary_path = os.path.join(output_dir, 'benchmark_summary_mean_std.csv')
+    summary_df.to_csv(summary_path, index=False)
+
+    print(f"\\nSaved raw results to: {raw_path}")
+    print(f"Saved summary to: {summary_path}")
+    return raw_df, summary_df
+
+
+# =========================================================
+# CLI (Colab/Jupyter-safe)
+# =========================================================
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--datasets', type=str, default='pathmnist,bloodmnist,dermamnist',
+                        help='Comma-separated MedMNIST subset flags.')
+    parser.add_argument('--optimizers', type=str, default='sgd,adam,proxsgd,tfgd,tfgdprox',
+                        help='Comma-separated optimizer names.')
+    parser.add_argument('--seeds', type=str, default='42,43,44',
+                        help='Comma-separated random seeds.')
+    parser.add_argument('--prox_mu_values', type=str, default='1e-5,1e-4,5e-4',
+                        help='Comma-separated proximal strengths for proximal optimizers.')
+
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--size', type=int, default=28)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--alpha', type=float, default=0.6)
+    parser.add_argument('--lam', type=float, default=0.5)
+    parser.add_argument('--M', type=int, default=20)
+    parser.add_argument('--M_feature', type=int, default=20)
+    parser.add_argument('--M_classifier', type=int, default=20)
+    parser.add_argument('--weight_decay', type=float, default=0.0)
+    parser.add_argument('--momentum', type=float, default=0.9)
+    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--device', type=str, default='auto')
+    parser.add_argument('--output_dir', type=str, default='outputs_v2')
+    parser.add_argument('--layer_specific_prox', action='store_true', default=True)
+    parser.add_argument('--prox_mu_feature_scale', type=float, default=0.1,
+                        help='Feature-layer prox = prox_mu * prox_mu_feature_scale when layer_specific_prox=True.')
+
+    parser.add_argument('--mode', type=str, default='grid', choices=['single', 'grid'])
+    parser.add_argument('--data_flag', type=str, default='pathmnist')
+    parser.add_argument('--optimizer', type=str, default='tfgdprox',
+                        choices=['sgd', 'adam', 'proxsgd', 'tfgd', 'tfgdprox'])
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--prox_mu', type=float, default=1e-4)
+
+    # Notebook-safe
+    args, _ = parser.parse_known_args()
+    return args
+
+
+# =========================================================
+# Main
+# =========================================================
+if __name__ == '__main__':
+    args = parse_args()
+
+    if args.mode == 'single':
+        run_experiment(
+            data_flag=args.data_flag,
+            optimizer_name=args.optimizer,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            size=args.size,
+            lr=args.lr,
+            alpha=args.alpha,
+            lam=args.lam,
+            M=args.M,
+            prox_mu=args.prox_mu,
+            prox_mu_feature=args.prox_mu * args.prox_mu_feature_scale,
+            prox_mu_classifier=args.prox_mu,
+            layer_specific_prox=args.layer_specific_prox and args.optimizer in {'proxsgd', 'tfgdprox'},
+            M_feature=args.M_feature,
+            M_classifier=args.M_classifier,
+            weight_decay=args.weight_decay,
+            momentum=args.momentum,
+            seed=args.seed,
+            device_str=args.device,
+            early_stop_patience=args.patience,
+            output_dir=args.output_dir,
+        )
+    else:
+        datasets = [x.strip() for x in args.datasets.split(',') if x.strip()]
+        optimizers = [x.strip() for x in args.optimizers.split(',') if x.strip()]
+        seeds = [int(x.strip()) for x in args.seeds.split(',') if x.strip()]
+        prox_mu_values = [float(x.strip()) for x in args.prox_mu_values.split(',') if x.strip()]
+
+        run_grid_benchmark(
+            datasets=datasets,
+            optimizers=optimizers,
+            seeds=seeds,
+            prox_mu_values=prox_mu_values,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            size=args.size,
+            lr=args.lr,
+            alpha=args.alpha,
+            lam=args.lam,
+            M=args.M,
+            weight_decay=args.weight_decay,
+            momentum=args.momentum,
+            device_str=args.device,
+            patience=args.patience,
+            output_dir=args.output_dir,
+            layer_specific_prox=args.layer_specific_prox,
+            prox_mu_feature_scale=args.prox_mu_feature_scale,
+            M_feature=args.M_feature,
+            M_classifier=args.M_classifier,
+        )
