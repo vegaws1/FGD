@@ -1,0 +1,308 @@
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import math
+import numpy as np
+from sklearn.metrics import roc_auc_score
+
+# =====================================================================
+# 1. TRUNCATED TFGD-PROX OPTIMIZER
+# =====================================================================
+class TFGD_Prox(torch.optim.Optimizer):
+    r"""
+    Proximal Tempered Fractional Gradient Descent (TFGD-Prox)
+    """
+
+    def __init__(self, params, lr=0.039, alpha=0.6, lambda_param=0.5, M=10, L_estimate=10.0):
+        if not 0.0 < alpha < 1.0:
+            raise ValueError(f"Invalid fractional order alpha: {alpha}")
+        if lambda_param <= 0.0:
+            raise ValueError(f"Invalid tempering parameter lambda: {lambda_param}")
+
+        defaults = dict(lr=lr, alpha=alpha, lambda_param=lambda_param, M=M)
+        super(TFGD_Prox, self).__init__(params, defaults)
+
+        # -----------------------------------------------------------------
+        # THEORETICAL BOUND VALIDATION (using estimated L)
+        # -----------------------------------------------------------------
+        d_alpha_lambda = (1.0 - math.exp(-lambda_param)) ** (-alpha)
+        theoretical_lr_bound = 1.0 / (d_alpha_lambda * L_estimate)
+
+        print(f"--- TFGD-Prox Initialization ---")
+        print(f"Alignment Coefficient (d_alpha_lambda): {d_alpha_lambda:.4f}")
+        print(f"Estimated Lipschitz Constant (L): {L_estimate}")
+
+        if lr > theoretical_lr_bound:
+            print(f"Note: lr={lr} slightly exceeds the theoretical convex bound of {theoretical_lr_bound:.4f}. "
+                  f"Convergence remains plausible in the present non-convex neural setting.")
+        else:
+            print(f"Note: lr={lr} satisfies the theoretical convex bound <= {theoretical_lr_bound:.4f} "
+                  f"assuming L_estimate is a valid upper bound.")
+        print(f"--------------------------------\n")
+
+        # Precompute tempered coefficients
+        self.omega = torch.zeros(M + 1)
+        w_j = 1.0
+        self.omega[0] = 1.0
+
+        for j in range(1, M + 1):
+            w_j = w_j * (j + alpha - 1) / j
+            self.omega[j] = w_j * torch.exp(torch.tensor(-lambda_param * j))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            M = group['M']
+            l1_penalty = group.get('l1_penalty', 0.0)
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['buffer'] = []
+
+                buffer = state['buffer']
+
+                # clone gradients before storing them in the memory buffer
+                buffer.insert(0, grad.clone())
+
+                if len(buffer) > M + 1:
+                    buffer.pop()
+
+                # truncated tempered memory direction
+                S_k = torch.zeros_like(p.data)
+                for j in range(len(buffer)):
+                    S_k.add_(buffer[j], alpha=self.omega[j].item())
+
+                temp_p = p.data - lr * S_k
+
+                # proximal soft-thresholding
+                if l1_penalty > 0:
+                    threshold = lr * l1_penalty
+                    p.data.copy_(torch.sign(temp_p) * torch.clamp(torch.abs(temp_p) - threshold, min=0.0))
+
+                    # edge-style irreversible pruning in the memory buffer
+                    mask = (p.data != 0.0).float()
+                    for b_grad in buffer:
+                        b_grad.mul_(mask)
+                else:
+                    p.data.copy_(temp_p)
+
+        return loss
+
+
+# =====================================================================
+# 2. EDGE MEDICAL CNN ARCHITECTURE
+# =====================================================================
+class EdgeMedicalCNN(nn.Module):
+    def __init__(self):
+        super(EdgeMedicalCNN, self).__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.fc_block = nn.Sequential(
+            nn.Linear(32 * 7 * 7, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.conv_block(x)
+        x = x.view(x.size(0), -1)
+        return self.fc_block(x)
+
+
+# =====================================================================
+# 3. SYNTHETIC MEDICAL DATA
+# =====================================================================
+torch.manual_seed(42)
+
+n_samples = 200
+X_data = torch.randn(n_samples, 1, 28, 28)
+y_data = torch.zeros(n_samples, 1)
+
+# Inject anomaly patch into half of the samples
+X_data[:100, 0, 12:17, 12:17] += 5.0
+y_data[:100, 0] = 1.0
+
+# shuffle
+indices = torch.randperm(n_samples)
+X_data = X_data[indices]
+y_data = y_data[indices]
+
+# split into train / test
+n_train = 160
+X_train, X_test = X_data[:n_train], X_data[n_train:]
+y_train, y_test = y_data[:n_train], y_data[n_train:]
+
+
+# =====================================================================
+# 4. INITIALIZATION & LAYER-SPECIFIC THRESHOLDING
+# =====================================================================
+model = EdgeMedicalCNN()
+criterion = nn.BCELoss()
+
+conv_params = [p for n, p in model.named_parameters() if 'conv' in n]
+fc_params = [p for n, p in model.named_parameters() if 'fc' in n]
+
+optim_groups = [
+    {'params': conv_params, 'l1_penalty': 0.0001, 'M': 10},
+    {'params': fc_params, 'l1_penalty': 0.05, 'M': 10}
+]
+
+optimizer = TFGD_Prox(
+    optim_groups,
+    lr=0.039,
+    alpha=0.6,
+    lambda_param=0.5,
+    L_estimate=10.0
+)
+
+
+# =====================================================================
+# 5. METRICS
+# =====================================================================
+def binary_accuracy(y_prob, y_true):
+    y_pred = (y_prob >= 0.5).float()
+    return (y_pred.eq(y_true).float().mean().item()) * 100.0
+
+def binary_auc(y_prob, y_true):
+    y_prob_np = y_prob.detach().cpu().numpy().reshape(-1)
+    y_true_np = y_true.detach().cpu().numpy().reshape(-1)
+    try:
+        return roc_auc_score(y_true_np, y_prob_np)
+    except Exception:
+        return float("nan")
+
+def compute_sparsity(params):
+    zero = sum((p.data == 0).sum().item() for p in params)
+    total = sum(p.numel() for p in params)
+    return (zero / total) * 100.0
+
+
+# =====================================================================
+# 6. TRAINING LOOP & TRACKING
+# =====================================================================
+epochs = 60
+
+train_loss_history = []
+train_acc_history = []
+test_acc_history = []
+test_auc_history = []
+conv_sparsity_history = []
+dense_sparsity_history = []
+
+print("Training EdgeMedicalCNN with Layer-Specific TFGD-Prox...\n")
+print(f"{'Epoch':<8} | {'Train Loss':<10} | {'Train Acc':<10} | {'Test Acc':<10} | {'Test AUC':<10} | {'Conv Sparsity':<15} | {'Dense Sparsity':<15}")
+print("-" * 105)
+
+for epoch in range(epochs):
+    model.train()
+    optimizer.zero_grad()
+
+    outputs = model(X_train)
+    loss = criterion(outputs, y_train)
+    loss.backward()
+    optimizer.step()
+
+    # training metrics
+    model.eval()
+    with torch.no_grad():
+        train_prob = model(X_train)
+        test_prob = model(X_test)
+
+        train_loss = criterion(train_prob, y_train).item()
+        train_acc = binary_accuracy(train_prob, y_train)
+        test_acc = binary_accuracy(test_prob, y_test)
+        test_auc = binary_auc(test_prob, y_test)
+
+    conv_sparsity = compute_sparsity(conv_params)
+    dense_sparsity = compute_sparsity(fc_params)
+
+    train_loss_history.append(train_loss)
+    train_acc_history.append(train_acc)
+    test_acc_history.append(test_acc)
+    test_auc_history.append(test_auc)
+    conv_sparsity_history.append(conv_sparsity)
+    dense_sparsity_history.append(dense_sparsity)
+
+    if (epoch + 1) % 10 == 0:
+        print(f"{epoch+1:<8} | {train_loss:<10.4f} | {train_acc:<10.2f} | {test_acc:<10.2f} | {test_auc:<10.4f} | {conv_sparsity:<14.2f}% | {dense_sparsity:<14.2f}%")
+
+
+# =====================================================================
+# 7. FINAL SUMMARY
+# =====================================================================
+final_train_loss = train_loss_history[-1]
+final_train_acc = train_acc_history[-1]
+final_test_acc = test_acc_history[-1]
+final_test_auc = test_auc_history[-1]
+final_conv_sparsity = conv_sparsity_history[-1]
+final_dense_sparsity = dense_sparsity_history[-1]
+
+print("\nFinal summary:")
+print(f"Train loss            : {final_train_loss:.4f}")
+print(f"Train accuracy (%)    : {final_train_acc:.2f}")
+print(f"Test accuracy (%)     : {final_test_acc:.2f}")
+print(f"Test AUC              : {final_test_auc:.4f}")
+print(f"Conv sparsity (%)     : {final_conv_sparsity:.2f}")
+print(f"Dense sparsity (%)    : {final_dense_sparsity:.2f}")
+
+
+# =====================================================================
+# 8. PLOTS FOR THE MANUSCRIPT
+# =====================================================================
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+# Panel 1: Sample synthetic images
+axes[0].imshow(X_data[y_data.squeeze() == 0][0, 0].numpy(), cmap='gray')
+axes[0].set_title("Healthy synthetic sample")
+axes[0].axis("off")
+
+# Create second figure panel as anomaly sample
+healthy_img = X_data[y_data.squeeze() == 0][0, 0].numpy()
+anomaly_img = X_data[y_data.squeeze() == 1][0, 0].numpy()
+
+axes[0].clear()
+axes[0].imshow(np.concatenate([healthy_img, anomaly_img], axis=1), cmap='gray')
+axes[0].set_title("Healthy (left) vs anomaly (right)")
+axes[0].axis("off")
+
+# Panel 2: Loss + accuracy
+axes[1].plot(train_loss_history, label='Train Loss', color='tab:blue', linewidth=2)
+axes[1].set_xlabel('Epochs')
+axes[1].set_ylabel('BCE Loss', color='tab:blue')
+axes[1].tick_params(axis='y', labelcolor='tab:blue')
+
+ax2 = axes[1].twinx()
+ax2.plot(test_acc_history, label='Test Accuracy', color='tab:green', linestyle='--', linewidth=2)
+ax2.set_ylabel('Test Accuracy (%)', color='tab:green')
+ax2.tick_params(axis='y', labelcolor='tab:green')
+axes[1].set_title('Optimization and generalization')
+
+# Panel 3: Conv vs dense sparsity
+axes[2].plot(conv_sparsity_history, label='Conv Sparsity', color='tab:orange', linewidth=2)
+axes[2].plot(dense_sparsity_history, label='Dense Sparsity', color='tab:red', linestyle='--', linewidth=2)
+axes[2].set_xlabel('Epochs')
+axes[2].set_ylabel('Sparsity (%)')
+axes[2].set_title('Layer-wise sparsification')
+axes[2].legend()
+
+plt.suptitle('TFGD-Prox: Synthetic Proof-of-Concept', fontsize=14)
+plt.tight_layout()
+plt.show()
